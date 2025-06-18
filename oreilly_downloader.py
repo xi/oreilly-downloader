@@ -31,7 +31,7 @@ async def fetch_book(book_id, zfh, session):
             content = content.replace(b_root_path, b'/EPUB/')
             zfh.writestr(path, content)
 
-    zfh.writestr('mimetype', b'application/epub+zip\n')
+    zfh.writestr('mimetype', b'application/epub+zip\n', compress_type=zipfile.ZIP_STORED)
     zfh.writestr('META-INF/container.xml', CONTAINER)
 
     url = BASE_URL + root_path
