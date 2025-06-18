@@ -29,14 +29,10 @@ async def fetch_book(book_id, zfh, session):
         async with session.get(url) as r:
             content = await r.read()
             content = content.replace(b_root_path, b'/EPUB/')
-            with zfh.open(path, 'w') as fh:
-                fh.write(content)
+            zfh.writestr(path, content)
 
-    with zfh.open('mimetype', 'w') as fh:
-        fh.write(b'application/epub+zip\n')
-
-    with zfh.open('META-INF/container.xml', 'w') as fh:
-        fh.write(CONTAINER)
+    zfh.writestr('mimetype', b'application/epub+zip\n')
+    zfh.writestr('META-INF/container.xml', CONTAINER)
 
     url = BASE_URL + root_path
     while url:
