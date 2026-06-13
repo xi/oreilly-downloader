@@ -7,6 +7,7 @@
 
 import argparse
 import asyncio
+import xml.etree.ElementTree as ET
 import zipfile
 from html import escape
 
@@ -121,6 +122,48 @@ async def fetch_book(book_id, zfh, session):
         ])
 
         url = data.get('next')
+
+    patch_opf(zfh)
+
+
+def patch_opf(zfh):
+    """Remove manifest/spine/guide entries for files that weren't downloaded."""
+    names = set(zfh.namelist())
+    opf_path = 'EPUB/content.opf'
+    if opf_path not in names:
+        return
+
+    ET.register_namespace('', 'http://www.idpf.org/2007/opf')
+    tree = ET.parse(zfh.open(opf_path))
+    root = tree.getroot()
+    ns = {'opf': 'http://www.idpf.org/2007/opf'}
+
+    manifest = root.find('opf:manifest', ns)
+    spine = root.find('opf:spine', ns)
+    guide = root.find('opf:guide', ns)
+
+    missing_ids = set()
+    for item in list(manifest):
+        href = item.get('href', '')
+        if f'EPUB/{href}' not in names:
+            missing_ids.add(item.get('id'))
+            manifest.remove(item)
+
+    if missing_ids:
+        for itemref in list(spine):
+            if itemref.get('idref') in missing_ids:
+                spine.remove(itemref)
+        if guide is not None:
+            for ref in list(guide):
+                href = ref.get('href', '')
+                if f'EPUB/{href}' not in names:
+                    guide.remove(ref)
+
+        ET.indent(tree, space='  ')
+        from io import BytesIO
+        buf = BytesIO()
+        tree.write(buf, xml_declaration=True, encoding='UTF-8')
+        zfh.writestr(opf_path, buf.getvalue())
 
 
 def parse_cookies(raw):
