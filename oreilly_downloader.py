@@ -34,7 +34,7 @@ async def fetch_book(book_id, zfh, session):
     async def download(url, path):
         async with session.get(url) as r:
             content = await r.read()
-            content = content.replace(b_root_path, b'/EPUB/')
+            content = content.replace(b_root_path, b'')
             zfh.writestr(path, content)
 
     zfh.writestr('mimetype', b'application/epub+zip', compress_type=zipfile.ZIP_STORED)
