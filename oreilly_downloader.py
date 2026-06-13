@@ -54,21 +54,38 @@ async def fetch_book(book_id, zfh, session):
         url = data.get('next')
 
 
+def parse_cookies(raw):
+    cookies = {}
+    for part in raw.split(';'):
+        part = part.strip()
+        if '=' in part:
+            k, _, v = part.partition('=')
+            cookies[k.strip()] = v.strip()
+    return cookies
+
+
 async def amain():
     parser = argparse.ArgumentParser()
     parser.add_argument('book_id')
-    parser.add_argument('--jwt')
+    parser.add_argument('--cookie', '--jwt', dest='cookie')
     args = parser.parse_args()
 
     filename = f'{args.book_id}.epub'
 
+    raw = args.cookie or ''
+    if raw.startswith('eyJ') or '.' in raw[:10]:
+        cookies = {'orm-jwt': raw}
+    else:
+        cookies = {k: v for k, v in parse_cookies(raw).items()
+                   if k in ('orm-jwt', 'orm-rt')}
+
     with zipfile.ZipFile(filename, 'w') as zfh:
         async with aiohttp.ClientSession(
             raise_for_status=True,
-            cookies={'orm-jwt': args.jwt},
+            cookies=cookies or None,
         ) as session:
-            if not args.jwt:
-                print('No JWT provided. Continuing without…')
+            if not cookies:
+                print('No credentials provided. Continuing without…')
             elif await check_auth(session):
                 print('Authentication successful.')
             else:
