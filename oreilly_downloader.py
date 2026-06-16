@@ -28,9 +28,13 @@ def to_xhtml(s, root_path):
     tree = lhtml.fromstring(s, parser=lhtml.HTMLParser(encoding='utf-8'))
 
     for el in list(tree.iter()):
+        # Skip comment nodes, PIs, etc. — their .tag is a callable, not a str
+        if not isinstance(el.tag, str):
+            continue
         for attr in ['href', 'src']:
-            if el.get(attr, '').startswith(root_path):
-                el.set(attr, el.get(attr).removeprefix(root_path))
+            val = el.get(attr)
+            if val and val.startswith(root_path):
+                el.set(attr, val.removeprefix(root_path))
 
     if tree.tag != 'html':
         wrapper = etree.Element('html', nsmap={
@@ -67,7 +71,10 @@ async def fetch_book(book_id, zfh, session):
     root_path = f'/api/v2/epubs/urn:orm:book:{book_id}/files/'
 
     async def download(url, path):
-        async with session.get(url) as r:
+        async with session.get(url, raise_for_status=False) as r:
+            if not r.ok:
+                print(f'WARNING: {r.status} fetching {url}')
+                return
             content = await r.read()
             if path.endswith('.html'):
                 content = to_xhtml(content, root_path)
@@ -79,7 +86,10 @@ async def fetch_book(book_id, zfh, session):
     url = BASE_URL + root_path
     while url:
         print(f'fetching {url}')
-        async with session.get(url) as r:
+        async with session.get(url, raise_for_status=False) as r:
+            if not r.ok:
+                print(f'ERROR: {r.status} {r.reason} — check your JWT token')
+                break
             data = await r.json()
 
         await asyncio.gather(*[
@@ -100,8 +110,8 @@ async def amain():
 
     with zipfile.ZipFile(filename, 'w') as zfh:
         async with aiohttp.ClientSession(
-            raise_for_status=True,
-            cookies={'orm-jwt': args.jwt},
+            raise_for_status=False,        # handle errors manually per-request
+            cookies={'orm-jwt': args.jwt} if args.jwt else {},
         ) as session:
             if not args.jwt:
                 print('No JWT provided. Continuing without…')
@@ -117,3 +127,4 @@ async def amain():
 
 if __name__ == '__main__':
     asyncio.run(amain())
+
