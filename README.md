@@ -17,7 +17,9 @@ Service](https://learning.oreilly.com/terms/).
 # Usage
 
 ```
-$ pip install aiohttp
+$ python3 -m venv .venv
+$ source .venv/bin/activate
+$ pip install -r requirements.txt
 $ python3 oreilly_downloader.py 9781491958698 --jwt 'XYZ'
 …
 created 9781491958698.epub

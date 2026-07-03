@@ -29,8 +29,9 @@ def to_xhtml(s, root_path):
 
     for el in list(tree.iter()):
         for attr in ['href', 'src']:
-            if el.get(attr, '').startswith(root_path):
-                el.set(attr, el.get(attr).removeprefix(root_path))
+            value = el.get(attr) or ''
+            if value.startswith(root_path):
+                el.set(attr, value.removeprefix(root_path))
 
     if tree.tag != 'html':
         wrapper = etree.Element('html', nsmap={
