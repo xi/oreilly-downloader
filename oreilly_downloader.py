@@ -29,7 +29,7 @@ def to_xhtml(s, root_path):
 
     for el in list(tree.iter()):
         for attr in ['href', 'src']:
-            if el.get(attr, '').startswith(root_path):
+            if (el.get(attr) or '').startswith(root_path):
                 el.set(attr, el.get(attr).removeprefix(root_path))
 
     if tree.tag != 'html':
@@ -63,56 +63,105 @@ async def check_auth(session):
         return r.ok
 
 
-async def fetch_book(book_id, zfh, session):
-    root_path = f'/api/v2/epubs/urn:orm:book:{book_id}/files/'
+async def fetch_book(book_id, session):
+    filename = f'{book_id}.epub'
 
-    async def download(url, path):
-        async with session.get(url) as r:
-            content = await r.read()
-            if path.endswith('.html'):
-                content = to_xhtml(content, root_path)
-            zfh.writestr(path, content)
+    with zipfile.ZipFile(filename, 'w') as zfh:
+        root_path = f'/api/v2/epubs/urn:orm:book:{book_id}/files/'
 
-    zfh.writestr('mimetype', b'application/epub+zip', compress_type=zipfile.ZIP_STORED)
-    zfh.writestr('META-INF/container.xml', CONTAINER)
+        async def download(url, path):
+            async with session.get(url) as r:
+                content = await r.read()
+                if path.endswith('.html'):
+                    content = to_xhtml(content, root_path)
+                zfh.writestr(path, content)
 
-    url = BASE_URL + root_path
-    while url:
-        print(f'fetching {url}')
-        async with session.get(url) as r:
-            data = await r.json()
+        zfh.writestr('mimetype', b'application/epub+zip', compress_type=zipfile.ZIP_STORED)
+        zfh.writestr('META-INF/container.xml', CONTAINER)
 
-        await asyncio.gather(*[
-            download(result['url'], f'EPUB/{result["full_path"]}')
-            for result in data.get('results', [])
-        ])
+        url = BASE_URL + root_path
+        while url:
+            print(f'fetching {url}')
+            async with session.get(url) as r:
+                data = await r.json()
 
-        url = data.get('next')
+            await asyncio.gather(*[
+                download(result['url'], f'EPUB/{result["full_path"]}')
+                for result in data.get('results', [])
+            ])
+
+            url = data.get('next')
+
+
+async def fetch_collections(session):
+    url = BASE_URL + '/api/v3/collections/'
+
+    async with session.get(url, raise_for_status=False) as r:
+        if r.status != 200:
+            return None
+
+        return await r.json()
+
+
+async def fetch_playlist(playlist_id, session):
+    collections = await fetch_collections(session)
+    
+    if collections is None:
+        return None
+
+    collection = next(c for c in collections if c.get('id') == playlist_id)
+    for book in collection.get('content'):
+        await fetch_book(book.get('api_url').split('/')[-2], session)
+
+
+async def fetch_all(session):
+    collections = await fetch_collections(session)
+
+    if collections is None:
+        print("Nothing to download.")
+        return
+
+    fetched_ids = set()
+    
+    for collection in collections:
+        for book in collection.get('content'):
+            book_id = book.get('api_url').split('/')[-2]
+
+            if book_id not in fetched_ids:
+                await fetch_book(book_id, session)
+
+            fetched_ids.add(book.get('api_url').split('/')[-2])
 
 
 async def amain():
     parser = argparse.ArgumentParser()
-    parser.add_argument('book_id')
+
+    target_options = parser.add_mutually_exclusive_group(required=True)
+    
+    target_options.add_argument('--all', action='store_true')
+    target_options.add_argument('--playlist', type=str)
+    target_options.add_argument('--book', type=str)
     parser.add_argument('--jwt')
+
     args = parser.parse_args()
 
-    filename = f'{args.book_id}.epub'
+    async with aiohttp.ClientSession(
+        raise_for_status=True,
+        cookies={'orm-jwt': args.jwt},
+    ) as session:
+        if not args.jwt:
+            print('No JWT provided. Continuing without…')
+        elif await check_auth(session):
+            print('Authentication successful.')
+        else:
+            print('Authentication failed. Continuing without…')
 
-    with zipfile.ZipFile(filename, 'w') as zfh:
-        async with aiohttp.ClientSession(
-            raise_for_status=True,
-            cookies={'orm-jwt': args.jwt},
-        ) as session:
-            if not args.jwt:
-                print('No JWT provided. Continuing without…')
-            elif await check_auth(session):
-                print('Authentication successful.')
-            else:
-                print('Authentication failed. Continuing without…')
-
-            await fetch_book(args.book_id, zfh, session)
-
-    print(f'created {filename}')
+        if args.all is True:
+            await fetch_all(session)
+        elif args.playlist is not None:
+            await fetch_playlist(args.playlist, session)
+        elif args.book is not None:
+            await fetch_book(args.book, session)
 
 
 if __name__ == '__main__':
