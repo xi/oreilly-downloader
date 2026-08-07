@@ -103,13 +103,13 @@ async def fetch_collections(session):
         return await r.json()
 
 
-async def fetch_playlist(playlist_id, session):
+async def fetch_collection(collection_id, session):
     collections = await fetch_collections(session)
     
     if collections is None:
         return None
 
-    collection = next(c for c in collections if c.get('id') == playlist_id)
+    collection = next(c for c in collections if c.get('id') == collection_id)
     for book in collection.get('content'):
         await fetch_book(book.get('api_url').split('/')[-2], session)
 
@@ -139,7 +139,7 @@ async def amain():
     target_options = parser.add_mutually_exclusive_group(required=True)
     
     target_options.add_argument('--all', action='store_true')
-    target_options.add_argument('--playlist', type=str)
+    target_options.add_argument('--collection', type=str)
     target_options.add_argument('--book', type=str)
     parser.add_argument('--jwt')
 
@@ -158,8 +158,8 @@ async def amain():
 
         if args.all is True:
             await fetch_all(session)
-        elif args.playlist is not None:
-            await fetch_playlist(args.playlist, session)
+        elif args.collection is not None:
+            await fetch_collection(args.collection, session)
         elif args.book is not None:
             await fetch_book(args.book, session)
 
