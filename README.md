@@ -16,11 +16,37 @@ Service](https://learning.oreilly.com/terms/).
 
 # Usage
 
+
+## Download a single book
+
 ```
 $ pip install aiohttp
-$ python3 oreilly_downloader.py 9781491958698 --jwt 'XYZ'
-…
+$ python3 oreilly_downloader.py --book 9781491958698 --jwt 'XYZ'
+...
 created 9781491958698.epub
+```
+
+## Download a playlist/collection 
+
+```
+$ pip install aiohttp
+$ python3 oreilly_downloader.py --collection <collection-id> --jwt 'XYZ'
+...
+created 9781491958698.epub
+created 9781491958699.epub
+```
+
+## Download all saved playlists/collections
+
+```
+$ pip install aiohttp
+$ python3 oreilly_downloader.py --all --jwt 'XYZ'
+...
+created 9781491958698.epub
+created 9781491958699.epub
+created 9781491958700.epub
+created 9781491958701.epub
+created 9781491958702.epub
 ```
 
 # Similar Projects
