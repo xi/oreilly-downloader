@@ -91,6 +91,8 @@ async def fetch_book(book_id, session):
             ])
 
             url = data.get('next')
+    
+    print(f'created {filename}')
 
 
 async def fetch_collections(session):
