@@ -84,14 +84,19 @@ IF AUTHENTICATION FAILS
 
     A handful of "FAILED to download ..." lines at the end, listing a few
     files, is usually transient rate-limiting - just run the exact same
-    command again; already-downloaded files are re-fetched too (the script
-    always rebuilds the .epub from scratch) but that's normally quick.
+    command again. Raw file bytes are cached under .oreilly_cache/<book_id>/
+    so a re-run only re-fetches what is still missing (or pass --force to
+    ignore the cache and re-download everything). The .epub itself is
+    always rebuilt from the cache so path rewriting stays consistent.
 
 OUTPUT
     A single <book_id>.epub file in the current directory, containing
     every file the O'Reilly API lists for that book, converted to valid
     XHTML content documents with all internal links, stylesheets, and
-    images rewritten to work as a normal, self-contained EPUB.
+    images rewritten to work as a normal, self-contained EPUB. When the
+    source only ships an EPUB2 NCX, an EPUB3 nav.xhtml is synthesised so
+    modern readers get a proper table of contents too. Calibre production
+    metadata (if present in the upstream package) is stripped.
 """
 
 import argparse
@@ -105,6 +110,8 @@ import re
 import sys
 import time
 import zipfile
+from pathlib import Path
+from urllib.parse import unquote
 
 import aiohttp
 import yarl
@@ -282,12 +289,20 @@ def _resolve_ref(value, root_path, current_dir):
     text/styles/base.css, silently failing to load - taking every bit of
     CSS-driven styling (colors, syntax highlighting, callouts, ...) with it.
 
-    Values that don't start with root_path (external URLs, fragment-only
-    anchors, data: URIs, etc.) are left untouched.
+    Also normalises percent-encoding and backslashes (real-world OPF/NCX/HTML
+    sometimes carries either), matching how a careful EPUB reader resolves
+    hrefs. Values that don't start with root_path (external URLs, fragment-
+    only anchors, data: URIs, etc.) are left untouched aside from that
+    light normalisation when they *do* start with root_path.
     """
-    if not value.startswith(root_path):
+    # Split off any #fragment so we never try to resolve it as a path.
+    path_part, sep, frag = value.partition('#')
+    path_part = unquote(path_part).replace('\\', '/')
+    if not path_part.startswith(root_path):
+        # Preserve original fragment attachment for non-API refs.
         return value
-    return _relpath(value.removeprefix(root_path), current_dir)
+    resolved = _relpath(path_part.removeprefix(root_path), current_dir)
+    return f'{resolved}#{frag}' if sep else resolved
 
 
 def _rewrite_srcset(value, root_path, current_dir):
@@ -353,11 +368,95 @@ def rewrite_css(content, root_path, full_path):
     return rewrite_css_text(text, root_path, current_dir).encode('utf-8')
 
 
+# Extensions that must be application/xhtml+xml in a valid EPUB manifest,
+# regardless of what the API (or an upstream Calibre pass) labelled them.
+_XHTML_MEDIA_TYPE = 'application/xhtml+xml'
+_XHTML_EXTS = ('.html', '.xhtml', '.htm')
+
+# Namespaces used when synthesising an EPUB3 nav document.
+_XHTML_NS = 'http://www.w3.org/1999/xhtml'
+_EPUB_NS = 'http://www.idpf.org/2007/ops'
+_NCX_NS = 'http://www.daisy.org/z3986/2005/ncx/'
+_OPF_NS = 'http://www.idpf.org/2007/opf'
+_DC_NS = 'http://purl.org/dc/elements/1.1/'
+
+# Default on-disk cache for raw API payloads (resume support).
+DEFAULT_CACHE_DIR = '.oreilly_cache'
+
+# Fixed path of the synthesised EPUB3 nav document inside the EPUB.
+NAV_PATH = 'nav.xhtml'
+
+
+def _local_tag(el):
+    """Return the element tag without any {namespace} prefix."""
+    tag = el.tag
+    if isinstance(tag, str) and tag.startswith('{'):
+        return tag.rsplit('}', 1)[-1]
+    return tag
+
+
+def _strip_calibre_metadata(tree):
+    """Remove Calibre production fingerprints from the package document.
+
+    Many Manning/O'Reilly packages were run through Calibre at some point
+    and carry calibre:* meta, a calibre xmlns on <metadata>, and a 'bkp'
+    contributor advertising the Calibre version. Harmless but noisy;
+    strip them so the finished EPUB looks like a clean publisher package.
+    """
+    for el in list(tree.iter()):
+        # Drop xmlns:calibre (and any other calibre-related) attribute on
+        # every element — most commonly the <metadata> wrapper.
+        for attr in list(el.attrib):
+            val = el.attrib.get(attr) or ''
+            if (attr.startswith('xmlns') and 'calibre' in val.lower()) or \
+               (attr.startswith('{') and 'calibre' in attr.lower()) or \
+               attr.lower().startswith('calibre') or \
+               'calibre.kovidgoyal' in val.lower():
+                del el.attrib[attr]
+
+        tag = _local_tag(el)
+        # calibre namespaced elements
+        if isinstance(el.tag, str) and 'calibre' in el.tag:
+            parent = el.getparent()
+            if parent is not None:
+                parent.remove(el)
+            continue
+        # <meta name="calibre:...">
+        if tag == 'meta':
+            name = (el.get('name') or '')
+            prop = (el.get('property') or '')
+            if name.startswith('calibre:') or prop.startswith('calibre:'):
+                parent = el.getparent()
+                if parent is not None:
+                    parent.remove(el)
+                continue
+        # <dc:contributor>calibre (...)</dc:contributor>
+        if tag == 'contributor':
+            text = (el.text or '').strip().lower()
+            if 'calibre' in text:
+                parent = el.getparent()
+                if parent is not None:
+                    parent.remove(el)
+                continue
+        # <dc:identifier opf:scheme="calibre">...</dc:identifier>
+        if tag == 'identifier':
+            scheme = (el.get(f'{{{_OPF_NS}}}scheme') or el.get('scheme') or '').lower()
+            if scheme == 'calibre':
+                parent = el.getparent()
+                if parent is not None:
+                    parent.remove(el)
+
+
 def rewrite_opf(content, root_path, full_path):
     """Rewrite href attributes inside the OPF package document so they
     become correct relative paths after the root_path prefix is removed.
     Also normalises the package so it remains valid EPUB after renaming
-    the file itself to content.opf.
+    the file itself to content.opf at the EPUB root.
+
+    Always resolve hrefs against the EPUB root (current_dir=''), not
+    against the OPF's original folder: fetch_book always writes the
+    package document as EPUB/content.opf, so any relative path computed
+    against e.g. OEBPS/ would be wrong once the file has been moved.
     """
     if isinstance(content, str):
         content = content.encode('utf-8')
@@ -366,11 +465,235 @@ def rewrite_opf(content, root_path, full_path):
     except etree.XMLSyntaxError:
         # Fall back to leaving the OPF untouched rather than dropping it.
         return content
-    current_dir = posixpath.dirname(full_path)
+    # OPF always ends up at EPUB/content.opf — resolve against root.
+    current_dir = ''
     for el in tree.iter():
         href = el.get('href')
         if href:
-            el.set('href', _resolve_ref(href, root_path, current_dir))
+            new_href = _resolve_ref(href, root_path, current_dir)
+            el.set('href', new_href)
+            # Force correct media-type for content documents. Some API
+            # manifests (and Calibre-touched upstream packages) still
+            # advertise text/html for .htm/.html files; readers that
+            # require application/xhtml+xml then refuse to render them.
+            if _local_tag(el) == 'item' and new_href:
+                path_only = new_href.split('#', 1)[0].lower()
+                if path_only.endswith(_XHTML_EXTS):
+                    el.set('media-type', _XHTML_MEDIA_TYPE)
+    _strip_calibre_metadata(tree)
+    out = etree.tostring(tree, xml_declaration=True, encoding='utf-8',
+                         pretty_print=True)
+    # lxml keeps original xmlns:calibre declarations in its internal nsmap
+    # (read-only), so they survive attribute deletion above. Strip any
+    # remaining calibre namespace decls from the serialised bytes.
+    out = re.sub(
+        br'\s+xmlns:calibre="[^"]*"',
+        b'',
+        out,
+    )
+    return out
+
+
+def rewrite_ncx(content, root_path, full_path):
+    """Rewrite src/href attributes inside an NCX navigation document.
+
+    NCX is not HTML, so it never went through to_xhtml; without this,
+    any API-prefixed content src= paths stay absolute and the TOC in
+    EPUB2 readers points at non-existent URLs. Always resolve against
+    the NCX file's own directory (usually the EPUB root). Also clears
+    Calibre generator metadata when present.
+    """
+    if isinstance(content, str):
+        content = content.encode('utf-8')
+    try:
+        tree = etree.fromstring(content)
+    except etree.XMLSyntaxError:
+        return content
+    current_dir = posixpath.dirname(full_path)
+    for el in tree.iter():
+        for attr in ('src', 'href'):
+            value = el.get(attr)
+            if value:
+                el.set(attr, _resolve_ref(value, root_path, current_dir))
+        # <meta name="dtb:generator" content="calibre (...)"/>
+        if _local_tag(el) == 'meta':
+            name = (el.get('name') or '').lower()
+            content_val = (el.get('content') or '').lower()
+            if name == 'dtb:generator' and 'calibre' in content_val:
+                parent = el.getparent()
+                if parent is not None:
+                    parent.remove(el)
+    return etree.tostring(tree, xml_declaration=True, encoding='utf-8',
+                          pretty_print=True)
+
+
+def _ncx_navpoints_to_ol(parent, ncx_dir, nav_dir):
+    """Recursively convert NCX navPoint children into an XHTML <ol> tree.
+
+    Paths in the NCX are relative to the NCX file; the nav document may
+    live in a different folder, so each href is re-based onto nav_dir.
+    """
+    ol = None
+    for np in parent:
+        if _local_tag(np) != 'navPoint':
+            continue
+        label = ''
+        href = ''
+        for child in np:
+            ctag = _local_tag(child)
+            if ctag == 'navLabel':
+                for t in child:
+                    if _local_tag(t) == 'text' and t.text:
+                        label = ' '.join(t.text.split())
+                        break
+            elif ctag == 'content':
+                src = child.get('src') or ''
+                if src:
+                    # Resolve against NCX dir → EPUB-root path, then
+                    # express relative to the nav document's directory.
+                    root_path = posixpath.normpath(
+                        posixpath.join(ncx_dir, unquote(src).replace('\\', '/'))
+                        if ncx_dir else unquote(src).replace('\\', '/')
+                    )
+                    href = _relpath(root_path, nav_dir)
+        child_ol = _ncx_navpoints_to_ol(np, ncx_dir, nav_dir)
+        if not label and not child_ol:
+            continue
+        if ol is None:
+            ol = etree.Element(f'{{{_XHTML_NS}}}ol')
+        li = etree.SubElement(ol, f'{{{_XHTML_NS}}}li')
+        if href:
+            a = etree.SubElement(li, f'{{{_XHTML_NS}}}a', href=href)
+            a.text = label or href
+        else:
+            span = etree.SubElement(li, f'{{{_XHTML_NS}}}span')
+            span.text = label or 'Untitled'
+        if child_ol is not None:
+            li.append(child_ol)
+    return ol
+
+
+def generate_nav_from_ncx(ncx_content, ncx_path, nav_path=NAV_PATH):
+    """Build a minimal EPUB3 nav.xhtml document from an NCX byte string.
+
+    Returns None if the NCX cannot be parsed or has no usable navPoints.
+    """
+    if isinstance(ncx_content, str):
+        ncx_content = ncx_content.encode('utf-8')
+    try:
+        ncx = etree.fromstring(ncx_content)
+    except etree.XMLSyntaxError:
+        return None
+
+    ncx_dir = posixpath.dirname(ncx_path)
+    nav_dir = posixpath.dirname(nav_path)
+
+    # Prefer <navMap>; fall back to scanning for navPoint anywhere.
+    nav_map = None
+    for el in ncx.iter():
+        if _local_tag(el) == 'navMap':
+            nav_map = el
+            break
+    if nav_map is None:
+        return None
+
+    ol = _ncx_navpoints_to_ol(nav_map, ncx_dir, nav_dir)
+    if ol is None:
+        return None
+
+    # Pull a title from NCX docTitle if present.
+    title_text = 'Table of Contents'
+    for el in ncx.iter():
+        if _local_tag(el) == 'docTitle':
+            for t in el:
+                if _local_tag(t) == 'text' and t.text and t.text.strip():
+                    title_text = ' '.join(t.text.split())
+                    break
+            break
+
+    html_el = etree.Element(f'{{{_XHTML_NS}}}html', nsmap={
+        None: _XHTML_NS,
+        'epub': _EPUB_NS,
+    })
+    head = etree.SubElement(html_el, f'{{{_XHTML_NS}}}head')
+    title_el = etree.SubElement(head, f'{{{_XHTML_NS}}}title')
+    title_el.text = title_text
+    body = etree.SubElement(html_el, f'{{{_XHTML_NS}}}body')
+    nav = etree.SubElement(body, f'{{{_XHTML_NS}}}nav')
+    nav.set(f'{{{_EPUB_NS}}}type', 'toc')
+    nav.set('id', 'toc')
+    h1 = etree.SubElement(nav, f'{{{_XHTML_NS}}}h1')
+    h1.text = 'Table of Contents'
+    nav.append(ol)
+
+    return etree.tostring(
+        html_el,
+        xml_declaration=True,
+        encoding='utf-8',
+        pretty_print=True,
+        doctype='<!DOCTYPE html>',
+    )
+
+
+def _opf_has_nav(tree):
+    """True if the package already declares an EPUB3 nav document."""
+    for el in tree.iter():
+        if _local_tag(el) != 'item':
+            continue
+        props = (el.get('properties') or '').split()
+        if 'nav' in props:
+            return True
+        href = (el.get('href') or '').lower()
+        if href.endswith('nav.xhtml') or href.endswith('nav.html'):
+            return True
+    return False
+
+
+def finalize_opf(opf_content, *, nav_path=None, bump_to_epub3=False):
+    """Post-process the rewritten OPF: optionally register a synthesised
+    nav document and bump the package version to 3.0 for dual NCX+nav.
+    """
+    if isinstance(opf_content, str):
+        opf_content = opf_content.encode('utf-8')
+    try:
+        tree = etree.fromstring(opf_content)
+    except etree.XMLSyntaxError:
+        return opf_content
+
+    if nav_path and not _opf_has_nav(tree):
+        # Find the <manifest> element.
+        manifest = None
+        for el in tree.iter():
+            if _local_tag(el) == 'manifest':
+                manifest = el
+                break
+        if manifest is not None:
+            # Avoid id collisions.
+            existing_ids = {
+                el.get('id') for el in manifest
+                if _local_tag(el) == 'item' and el.get('id')
+            }
+            nav_id = 'nav'
+            n = 1
+            while nav_id in existing_ids:
+                n += 1
+                nav_id = f'nav{n}'
+            item = etree.SubElement(manifest, f'{{{_OPF_NS}}}item')
+            # If the package isn't namespaced on children, use a bare tag.
+            if not any(isinstance(c.tag, str) and c.tag.startswith('{')
+                       for c in manifest):
+                manifest.remove(item)
+                item = etree.SubElement(manifest, 'item')
+            item.set('id', nav_id)
+            item.set('href', nav_path)
+            item.set('media-type', _XHTML_MEDIA_TYPE)
+            item.set('properties', 'nav')
+
+    if bump_to_epub3:
+        ver = tree.get('version') or ''
+        if not ver.startswith('3'):
+            tree.set('version', '3.0')
+
     return etree.tostring(tree, xml_declaration=True, encoding='utf-8',
                           pretty_print=True)
 
@@ -724,7 +1047,8 @@ async def check_auth(session, *, max_attempts=5):
     return False, last_status, 'gave up'
 
 
-async def fetch_book(book_id, zfh, session, concurrency=DEFAULT_CONCURRENCY):
+async def fetch_book(book_id, zfh, session, concurrency=DEFAULT_CONCURRENCY,
+                     cache_dir=None, force=False, make_nav=True):
     root_path = f'/api/v2/epubs/urn:orm:book:{book_id}/files/'
 
     zfh.writestr('mimetype', b'application/epub+zip', compress_type=zipfile.ZIP_STORED)
@@ -743,21 +1067,55 @@ async def fetch_book(book_id, zfh, session, concurrency=DEFAULT_CONCURRENCY):
         url = data.get('next')
 
     css_paths = [r['full_path'] for r in results if r['full_path'].endswith('.css')]
+    total = len(results)
+    cache_root = Path(cache_dir or DEFAULT_CACHE_DIR) / str(book_id)
+    cache_root.mkdir(parents=True, exist_ok=True)
 
     failed = []
+    # Processed members keyed by path inside the EPUB/ folder (e.g.
+    # 'content.opf', 'OEBPS/Text/01.htm'). Built fully before writing so
+    # we can synthesise nav.xhtml and patch the OPF afterward.
+    members = {}
+    done = 0
+    cached_hits = 0
+    progress_lock = asyncio.Lock()
 
     async def download(result, sem):
+        nonlocal done, cached_hits
         full_path = result['full_path']
+        # Cache key mirrors the EPUB-relative path; nested dirs are fine.
+        cache_path = cache_root / full_path
+        content = None
+        from_cache = False
+
         async with sem:
-            # A little jitter between requests avoids bursty, all-at-once
-            # request patterns that are more likely to trip rate limiting.
-            await asyncio.sleep(random.uniform(0, 0.2))
-            try:
-                content = await get_with_retry(session, result['url'])
-            except (aiohttp.ClientResponseError, RuntimeError) as exc:
-                print(f'FAILED to download {full_path}: {exc}')
-                failed.append(full_path)
-                return
+            if (not force and cache_path.is_file()
+                    and cache_path.stat().st_size > 0):
+                try:
+                    content = cache_path.read_bytes()
+                    from_cache = True
+                except OSError:
+                    content = None
+
+            if content is None:
+                # A little jitter between requests avoids bursty, all-at-once
+                # request patterns that are more likely to trip rate limiting.
+                await asyncio.sleep(random.uniform(0, 0.2))
+                try:
+                    content = await get_with_retry(session, result['url'])
+                except (aiohttp.ClientResponseError, RuntimeError) as exc:
+                    print(f'FAILED to download {full_path}: {exc}')
+                    failed.append(full_path)
+                    async with progress_lock:
+                        done += 1
+                    return
+                try:
+                    cache_path.parent.mkdir(parents=True, exist_ok=True)
+                    cache_path.write_bytes(content)
+                except OSError as exc:
+                    # Cache is best-effort; a write failure must not abort
+                    # a successful download.
+                    print(f'  warning: could not cache {full_path}: {exc}')
 
         # A network failure is handled above without derailing the rest of
         # the book (that's the whole point of get_with_retry), but a
@@ -767,6 +1125,7 @@ async def fetch_book(book_id, zfh, session, concurrency=DEFAULT_CONCURRENCY):
         # asyncio.gather below, aborting every other in-flight download
         # too. One bad file should be reported and skipped like any other
         # failure, not take the whole run down with it.
+        out_path = full_path
         try:
             if full_path.endswith(HTML_EXTENSIONS):
                 content = to_xhtml(content, root_path, full_path, css_paths)
@@ -774,37 +1133,76 @@ async def fetch_book(book_id, zfh, session, concurrency=DEFAULT_CONCURRENCY):
                 content = rewrite_css(content, root_path, full_path)
             elif full_path.endswith('.opf'):
                 content = rewrite_opf(content, root_path, full_path)
+                # The API doesn't always name the package document
+                # "content.opf" (e.g. it may be "9780138308667.opf") but
+                # container.xml always points at "EPUB/content.opf".
+                out_path = 'content.opf'
+            elif full_path.endswith('.ncx'):
+                content = rewrite_ncx(content, root_path, full_path)
         except Exception as exc:  # noqa: BLE001 - skip just this file
             print(f'FAILED to process {full_path}: {exc!r}')
             failed.append(full_path)
+            async with progress_lock:
+                done += 1
             return
 
-        # The API doesn't always name the package document "content.opf"
-        # (e.g. it may be "9780138308667.opf") but container.xml above
-        # always points at "EPUB/content.opf" - write it under that fixed
-        # name so the two agree regardless of what the API calls it.
-        if full_path.endswith('.opf'):
-            full_path = 'content.opf'
-
-        zfh.writestr(f'EPUB/{full_path}', content)
+        members[out_path] = content
+        async with progress_lock:
+            done += 1
+            if from_cache:
+                cached_hits += 1
+            if done % 25 == 0 or done == total:
+                print(f'  {done}/{total} files'
+                      + (f' ({cached_hits} from cache)' if cached_hits else ''))
 
     # Unbounded concurrency across a whole book can trip the API's rate
     # limiting, which shows up as random missing/truncated pages rather than
     # a clean error. Cap how many requests are in flight at once.
     sem = asyncio.Semaphore(max(1, concurrency))
 
-    print(f'downloading {len(results)} files (concurrency={concurrency})')
+    print(f'downloading {total} files (concurrency={concurrency}'
+          f', cache={cache_root}'
+          + (', force re-fetch' if force else '')
+          + ')')
     await asyncio.gather(*[download(result, sem) for result in results])
+
+    # --- EPUB3 nav from NCX (when the package has no nav of its own) -----
+    if make_nav:
+        ncx_path = next((p for p in members if p.endswith('.ncx')), None)
+        already_has_nav = any(
+            p.lower().endswith(('nav.xhtml', 'nav.html')) for p in members
+        )
+        if ncx_path and not already_has_nav and 'content.opf' in members:
+            nav_bytes = generate_nav_from_ncx(members[ncx_path], ncx_path)
+            if nav_bytes:
+                members[NAV_PATH] = nav_bytes
+                members['content.opf'] = finalize_opf(
+                    members['content.opf'],
+                    nav_path=NAV_PATH,
+                    bump_to_epub3=True,
+                )
+                print(f'  added EPUB3 nav.xhtml (from {ncx_path})')
+            else:
+                # Still strip/bump nothing; leave OPF as rewritten.
+                pass
+        elif 'content.opf' in members:
+            # No nav to inject, but re-run finalize for any future hooks.
+            members['content.opf'] = finalize_opf(members['content.opf'])
+
+    for out_path, content in members.items():
+        zfh.writestr(f'EPUB/{out_path}', content)
 
     if failed:
         print()
-        print(f'WARNING: {len(failed)} of {len(results)} files failed to '
+        print(f'WARNING: {len(failed)} of {total} files failed to '
               f'download and are missing from the epub:')
         for full_path in failed:
             print(f'  {full_path}')
         print('This is usually transient rate-limiting or an expired JWT - '
-              'try running again (see --cookies for something more durable '
-              'than passing --jwt by hand each time).')
+              'try running again; cached files will be reused automatically '
+              '(pass --force to re-download everything).')
+    elif cached_hits:
+        print(f'reused {cached_hits}/{total} files from cache')
 
 
 def _make_record(name, value, **overrides):
@@ -1146,6 +1544,21 @@ async def amain():
         "to .oreilly_webview_profile next to wherever --cookies points, "
         "or ./oreilly_webview_profile if --cookies wasn't given."
     ))
+    parser.add_argument('--cache-dir', metavar='PATH', default=DEFAULT_CACHE_DIR,
+                        help=(
+                            "Directory for caching raw API file bytes so a "
+                            "re-run only fetches what is still missing "
+                            f"(default: {DEFAULT_CACHE_DIR}/<book_id>/)."
+                        ))
+    parser.add_argument('--force', action='store_true', help=(
+        "Ignore the on-disk cache and re-download every file. The .epub is "
+        "always rebuilt either way; this only forces fresh network fetches."
+    ))
+    parser.add_argument('--no-nav', action='store_true', help=(
+        "Do not synthesise an EPUB3 nav.xhtml from the NCX. By default a "
+        "nav document is generated when the package only has an EPUB2 "
+        "NCX, so modern readers get a working table of contents."
+    ))
     args = parser.parse_args()
 
     records = {}
@@ -1290,6 +1703,9 @@ async def amain():
                     await fetch_book(
                         args.book_id, zfh, session,
                         concurrency=args.concurrency,
+                        cache_dir=args.cache_dir,
+                        force=args.force,
+                        make_nav=not args.no_nav,
                     )
                 finally:
                     # Save even on failure/Ctrl-C part-way through: whatever
