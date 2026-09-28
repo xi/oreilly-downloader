@@ -117,7 +117,10 @@ BASE_URL = 'https://learning.oreilly.com'
 # Extensions the API serves as (X)HTML content documents. Everything else
 # (css, images, fonts, ncx, opf, etc.) is written through unmodified, except
 # for .css which gets its own url()/@import rewrite below.
-HTML_EXTENSIONS = ('.html', '.xhtml')
+# .htm is common in older Manning / O'Reilly titles (this book's chapters
+# are all *.htm); without it those files are written through untouched and
+# every image/CSS reference stays as an absolute /api/v2/... path.
+HTML_EXTENSIONS = ('.html', '.xhtml', '.htm')
 
 # Statuses worth retrying: O'Reilly appears to answer with a plain 403
 # (rather than 429) when it wants a client to back off, alongside the usual
