@@ -57,7 +57,7 @@ Every example below uses `python3 oreilly_downloader.py ...`; substitute `uv run
    $ python3 oreilly_downloader.py 9781098148706 --cookies cookies.json
    Authentication successful.
      JWT valid for ~47m
-   listing https://learning.oreilly.com/api/v2/epubs/urn:orm:book:9781633437777/files/
+   listing https://learning.oreilly.com/api/v2/epubs/urn:orm:book:9781098148706/files/
    downloading 342 files (concurrency=8, cache=.oreilly_cache/9781098148706)
      25/342 files
      50/342 files
@@ -68,7 +68,7 @@ Every example below uses `python3 oreilly_downloader.py ...`; substitute `uv run
    created 9781098148706.epub
    ```
 
-That's it — `9781633437777.epub` is a complete, standalone book.
+That's it — `9781098148706.epub` is a complete, standalone book.
 
 Re-run the exact same command whenever you want another book (just change the id), or to rebuild the same book after a partial failure. Cached files are reused automatically:
 
