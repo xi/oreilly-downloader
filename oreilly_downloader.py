@@ -210,6 +210,10 @@ async def get_with_retry(session, url, *, max_attempts=30, base_delay=3.0,
 
     Consecutive 403s abort early so an expired session does not hang for
     many minutes under max_attempts.
+
+    Empty 200 bodies are treated as transient failures (not success): some
+    edge/CDN glitches return HTTP 200 with zero bytes, and caching that
+    would poison every later re-run until --force.
     """
     consecutive_403 = 0
     for attempt in range(1, max_attempts + 1):
@@ -217,7 +221,21 @@ async def get_with_retry(session, url, *, max_attempts=30, base_delay=3.0,
             async with session.get(url) as r:
                 r.raise_for_status()
                 consecutive_403 = 0
-                return await r.read()
+                data = await r.read()
+                if not data:
+                    short = url.split('/files/')[-1] if '/files/' in url else url
+                    if attempt == max_attempts:
+                        raise RuntimeError(
+                            f'Empty 200 body for {short} after {max_attempts} '
+                            f'attempts — not caching.'
+                        )
+                    delay = min(base_delay * (2 ** (attempt - 1)), max_delay) \
+                        + random.uniform(0, 0.5)
+                    print(f'  got empty 200 body fetching {short}, retrying in '
+                          f'{delay:.1f}s (attempt {attempt}/{max_attempts})')
+                    await asyncio.sleep(delay)
+                    continue
+                return data
         except aiohttp.ClientResponseError as exc:
             if exc.status == 403:
                 consecutive_403 += 1
@@ -649,9 +667,45 @@ def _opf_has_nav(tree):
     return False
 
 
+def _ensure_dcterms_modified(tree):
+    """EPUB 3 requires <meta property="dcterms:modified">YYYY-MM-DDThh:mm:ssZ</meta>.
+
+    Insert or refresh it under <metadata>. Harmless on EPUB 2 packages and
+    required once we bump version to 3.0 for the synthesised nav.
+    """
+    metadata = None
+    for el in tree.iter():
+        if _local_tag(el) == 'metadata':
+            metadata = el
+            break
+    if metadata is None:
+        return
+
+    modified = None
+    for el in metadata:
+        if _local_tag(el) == 'meta' and (el.get('property') or '') == 'dcterms:modified':
+            modified = el
+            break
+
+    # UTC timestamp without fractional seconds, with Z suffix (EPUB 3 form).
+    stamp = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+    if modified is not None:
+        modified.text = stamp
+        return
+
+    # Prefer namespaced children when the metadata block already uses them.
+    use_ns = any(isinstance(c.tag, str) and c.tag.startswith('{')
+                 for c in metadata)
+    tag = f'{{{_OPF_NS}}}meta' if use_ns else 'meta'
+    meta = etree.SubElement(metadata, tag)
+    meta.set('property', 'dcterms:modified')
+    meta.text = stamp
+
+
 def finalize_opf(opf_content, *, nav_path=None, bump_to_epub3=False):
     """Post-process the rewritten OPF: optionally register a synthesised
-    nav document and bump the package version to 3.0 for dual NCX+nav.
+    nav document, ensure dcterms:modified, and bump package version to 3.0
+    when dual NCX+nav is in use.
     """
     if isinstance(opf_content, str):
         opf_content = opf_content.encode('utf-8')
@@ -693,6 +747,9 @@ def finalize_opf(opf_content, *, nav_path=None, bump_to_epub3=False):
         ver = tree.get('version') or ''
         if not ver.startswith('3'):
             tree.set('version', '3.0')
+
+    # Always keep dcterms:modified current (required for EPUB 3 packages).
+    _ensure_dcterms_modified(tree)
 
     return etree.tostring(tree, xml_declaration=True, encoding='utf-8',
                           pretty_print=True)
@@ -1047,6 +1104,29 @@ async def check_auth(session, *, max_attempts=5):
     return False, last_status, 'gave up'
 
 
+def _safe_cache_path(cache_root, full_path):
+    """Map an API full_path to a file under cache_root, rejecting escapes.
+
+    pathlib discards the left operand when the right is absolute
+    (Path('/cache') / '/OEBPS/x' == Path('/OEBPS/x')), and '..'
+    segments can climb out of the cache tree. Normalise and verify the
+    result still lives under cache_root.
+    """
+    # Treat as a relative POSIX path regardless of OS separators.
+    rel = unquote(str(full_path).replace('\\', '/')).lstrip('/')
+    rel = posixpath.normpath(rel)
+    if rel in ('', '.', '..') or rel.startswith('../') or posixpath.isabs(rel):
+        raise ValueError(f'unsafe cache path: {full_path!r}')
+    path = cache_root / rel
+    # Path.resolve() follows symlinks; use absolute()+parts compare so a
+    # not-yet-created file still validates.
+    try:
+        path.resolve().relative_to(cache_root.resolve())
+    except ValueError as exc:
+        raise ValueError(f'cache path escapes root: {full_path!r}') from exc
+    return path
+
+
 async def fetch_book(book_id, zfh, session, concurrency=DEFAULT_CONCURRENCY,
                      cache_dir=None, force=False, make_nav=True):
     root_path = f'/api/v2/epubs/urn:orm:book:{book_id}/files/'
@@ -1075,6 +1155,8 @@ async def fetch_book(book_id, zfh, session, concurrency=DEFAULT_CONCURRENCY,
     # Processed members keyed by path inside the EPUB/ folder (e.g.
     # 'content.opf', 'OEBPS/Text/01.htm'). Built fully before writing so
     # we can synthesise nav.xhtml and patch the OPF afterward.
+    # Mutations happen under progress_lock so concurrent tasks never interleave
+    # dict/list updates even if this is later driven by multiple threads.
     members = {}
     done = 0
     cached_hits = 0
@@ -1083,8 +1165,15 @@ async def fetch_book(book_id, zfh, session, concurrency=DEFAULT_CONCURRENCY,
     async def download(result, sem):
         nonlocal done, cached_hits
         full_path = result['full_path']
-        # Cache key mirrors the EPUB-relative path; nested dirs are fine.
-        cache_path = cache_root / full_path
+        try:
+            cache_path = _safe_cache_path(cache_root, full_path)
+        except ValueError as exc:
+            print(f'FAILED to cache-map {full_path}: {exc}')
+            async with progress_lock:
+                failed.append(full_path)
+                done += 1
+            return
+
         content = None
         from_cache = False
 
@@ -1105,26 +1194,24 @@ async def fetch_book(book_id, zfh, session, concurrency=DEFAULT_CONCURRENCY,
                     content = await get_with_retry(session, result['url'])
                 except (aiohttp.ClientResponseError, RuntimeError) as exc:
                     print(f'FAILED to download {full_path}: {exc}')
-                    failed.append(full_path)
                     async with progress_lock:
+                        failed.append(full_path)
                         done += 1
                     return
-                try:
-                    cache_path.parent.mkdir(parents=True, exist_ok=True)
-                    cache_path.write_bytes(content)
-                except OSError as exc:
-                    # Cache is best-effort; a write failure must not abort
-                    # a successful download.
-                    print(f'  warning: could not cache {full_path}: {exc}')
+                # Never persist an empty payload — a bad 200 must not poison
+                # the cache after the server recovers.
+                if content:
+                    try:
+                        cache_path.parent.mkdir(parents=True, exist_ok=True)
+                        cache_path.write_bytes(content)
+                    except OSError as exc:
+                        # Cache is best-effort; a write failure must not abort
+                        # a successful download.
+                        print(f'  warning: could not cache {full_path}: {exc}')
 
-        # A network failure is handled above without derailing the rest of
-        # the book (that's the whole point of get_with_retry), but a
-        # processing failure - a chapter with markup lxml can't parse, a
-        # stylesheet in an encoding other than UTF-8 - previously wasn't:
-        # it propagated out of this coroutine and through the unguarded
-        # asyncio.gather below, aborting every other in-flight download
-        # too. One bad file should be reported and skipped like any other
-        # failure, not take the whole run down with it.
+        # Processing runs *outside* the download semaphore so CPU-bound
+        # XHTML rewriting does not stall other network fetches. A processing
+        # failure must not take down the whole gather — only this file.
         out_path = full_path
         try:
             if full_path.endswith(HTML_EXTENSIONS):
@@ -1141,13 +1228,21 @@ async def fetch_book(book_id, zfh, session, concurrency=DEFAULT_CONCURRENCY,
                 content = rewrite_ncx(content, root_path, full_path)
         except Exception as exc:  # noqa: BLE001 - skip just this file
             print(f'FAILED to process {full_path}: {exc!r}')
-            failed.append(full_path)
+            # Drop the cache entry so a later re-run refetches after the
+            # server (or our rewriter) recovers, instead of replaying poison.
+            try:
+                if cache_path.is_file():
+                    cache_path.unlink()
+                    print(f'  removed bad cache entry for {full_path}')
+            except OSError:
+                pass
             async with progress_lock:
+                failed.append(full_path)
                 done += 1
             return
 
-        members[out_path] = content
         async with progress_lock:
+            members[out_path] = content
             done += 1
             if from_cache:
                 cached_hits += 1
@@ -1166,13 +1261,20 @@ async def fetch_book(book_id, zfh, session, concurrency=DEFAULT_CONCURRENCY,
           + ')')
     await asyncio.gather(*[download(result, sem) for result in results])
 
+    if 'content.opf' not in members:
+        raise RuntimeError(
+            'Package document (content.opf) missing after download — '
+            'cannot build a valid EPUB. Re-run with a live session; if the '
+            'OPF keeps failing, try --force to bypass a bad cache entry.'
+        )
+
     # --- EPUB3 nav from NCX (when the package has no nav of its own) -----
     if make_nav:
         ncx_path = next((p for p in members if p.endswith('.ncx')), None)
         already_has_nav = any(
             p.lower().endswith(('nav.xhtml', 'nav.html')) for p in members
         )
-        if ncx_path and not already_has_nav and 'content.opf' in members:
+        if ncx_path and not already_has_nav:
             nav_bytes = generate_nav_from_ncx(members[ncx_path], ncx_path)
             if nav_bytes:
                 members[NAV_PATH] = nav_bytes
@@ -1182,13 +1284,12 @@ async def fetch_book(book_id, zfh, session, concurrency=DEFAULT_CONCURRENCY,
                     bump_to_epub3=True,
                 )
                 print(f'  added EPUB3 nav.xhtml (from {ncx_path})')
-            else:
-                # Still strip/bump nothing; leave OPF as rewritten.
-                pass
-        elif 'content.opf' in members:
-            # No nav to inject, but re-run finalize for any future hooks.
+        else:
+            # No nav to inject (or one already present); still run finalize
+            # for any future hooks / consistency.
             members['content.opf'] = finalize_opf(members['content.opf'])
 
+    # Single-threaded write after gather — ZipFile is not concurrent-safe.
     for out_path, content in members.items():
         zfh.writestr(f'EPUB/{out_path}', content)
 
