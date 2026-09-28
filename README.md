@@ -34,14 +34,14 @@ Before any usage, please read the [O'Reilly Terms of Service](https://learning.o
 The script declares its own dependencies inline, so with [`uv`](https://docs.astral.sh/uv/) installed you don't need a separate install step at all — `uv run` fetches them automatically the first time:
 
 ```
-$ uv run oreilly_downloader.py 9781633437777 --cookies cookies.json
+$ uv run oreilly_downloader.py 9781098148706 --cookies cookies.json
 ```
 
 Without `uv`, install the dependencies yourself and run it with `python3`:
 
 ```
 $ pip install aiohttp lxml yarl
-$ python3 oreilly_downloader.py 9781633437777 --cookies cookies.json
+$ python3 oreilly_downloader.py 9781098148706 --cookies cookies.json
 ```
 
 Every example below uses `python3 oreilly_downloader.py ...`; substitute `uv run oreilly_downloader.py ...` if that's how you installed it.
@@ -50,22 +50,22 @@ Every example below uses `python3 oreilly_downloader.py ...`; substitute `uv run
 
 1. Log into [learning.oreilly.com](https://learning.oreilly.com) in your browser.
 2. Install a cookie-export extension — e.g. [Cookie-Editor](https://cookie-editor.com/) (Chrome, Firefox, Edge) or EditThisCookie — and export **all cookies for the site** to a file called `cookies.json`. You don't need to hand-pick which cookies to include; anything not scoped to `oreilly.com` is ignored automatically.
-3. Find the book's ID: it's the string of digits in the book's learning.oreilly.com URL. For `https://learning.oreilly.com/library/view/some-book/9781633437777/`, the id is `9781633437777`.
+3. Find the book's ID: it's the string of digits in the book's learning.oreilly.com URL. For `https://learning.oreilly.com/library/view/some-book/9781098148706/`, the id is `9781098148706`.
 4. Run:
 
    ```
-   $ python3 oreilly_downloader.py 9781633437777 --cookies cookies.json
+   $ python3 oreilly_downloader.py 9781098148706 --cookies cookies.json
    Authentication successful.
      JWT valid for ~47m
    listing https://learning.oreilly.com/api/v2/epubs/urn:orm:book:9781633437777/files/
-   downloading 342 files (concurrency=8, cache=.oreilly_cache/9781633437777)
+   downloading 342 files (concurrency=8, cache=.oreilly_cache/9781098148706)
      25/342 files
      50/342 files
      ...
      342/342 files
      added EPUB3 nav.xhtml (from toc.ncx)
    saved current cookies to cookies.json
-   created 9781633437777.epub
+   created 9781098148706.epub
    ```
 
 That's it — `9781633437777.epub` is a complete, standalone book.
@@ -73,10 +73,10 @@ That's it — `9781633437777.epub` is a complete, standalone book.
 Re-run the exact same command whenever you want another book (just change the id), or to rebuild the same book after a partial failure. Cached files are reused automatically:
 
 ```
-   downloading 342 files (concurrency=8, cache=.oreilly_cache/9781633437777)
+   downloading 342 files (concurrency=8, cache=.oreilly_cache/9781098148706)
      342/342 files (342 from cache)
    reused 342/342 files from cache
-   created 9781633437777.epub
+   created 9781098148706.epub
 ```
 
 `--cookies` keeps itself up to date on every run (see below), so in practice you'll only need to re-export from the browser once in a while, not before every download.
@@ -165,7 +165,7 @@ It also needs a native GUI toolkit already present on your system:
 ### Usage
 
 ```
-$ python3 oreilly_downloader.py 9781633437777 --cookies cookies.json --webview
+$ python3 oreilly_downloader.py 9781098148706 --cookies cookies.json --webview
 ```
 
 `--webview` kicks in automatically in two situations:
