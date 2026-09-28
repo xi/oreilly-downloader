@@ -12,10 +12,16 @@ Before any usage, please read the [O'Reilly Terms of Service](https://learning.o
 ## Features
 
 - Rebuilds a complete, valid EPUB: every chapter, stylesheet, and image the API lists, with all internal links and references rewritten so the result works as a normal self-contained book, not a pile of loose files.
+- Handles real-world chapter extensions (`.html`, `.xhtml`, **and** `.htm` — common in older Manning titles) so images and stylesheets are not left pointing at dead API URLs.
 - Authenticates with your actual browser cookies, not just a short-lived token, so a session lasts as long as your real login does instead of expiring within the hour.
 - Understands *why* a request failed instead of just reporting a bare error: it tells you whether your token has genuinely expired (checked locally, no network needed) or whether something else is blocking the request regardless of your login being fine.
 - Can open a real, native browser window to log in directly when nothing else works — see [Using `--webview`](#using---webview) below.
 - Retries transient failures (rate limiting, brief network blips) on its own; a handful of flaky files won't take down an entire large book.
+- **Caches** raw file bytes under `.oreilly_cache/<book_id>/` so a re-run only fetches what is still missing. The `.epub` is always rebuilt from the cache so path rewriting stays consistent. Pass `--force` to ignore the cache.
+- Shows download progress (`N/M files`, including how many came from cache).
+- When the package only has an EPUB2 NCX, synthesises an **EPUB3 `nav.xhtml`** and bumps the package to version 3.0 so modern readers get a working table of contents (NCX is kept for older readers). Disable with `--no-nav`.
+- Strips Calibre production metadata from the package document when present (common on Manning/O'Reilly packages that were run through Calibre upstream).
+- Normalises OPF media-types for content documents to `application/xhtml+xml`, rewrites NCX `src`/`href` paths, and resolves references against the EPUB root after renaming the package to `content.opf`.
 
 ## Requirements
 
@@ -52,14 +58,28 @@ Every example below uses `python3 oreilly_downloader.py ...`; substitute `uv run
    Authentication successful.
      JWT valid for ~47m
    listing https://learning.oreilly.com/api/v2/epubs/urn:orm:book:9781633437777/files/
-   downloading 342 files (concurrency=8)
+   downloading 342 files (concurrency=8, cache=.oreilly_cache/9781633437777)
+     25/342 files
+     50/342 files
+     ...
+     342/342 files
+     added EPUB3 nav.xhtml (from toc.ncx)
    saved current cookies to cookies.json
    created 9781633437777.epub
    ```
 
 That's it — `9781633437777.epub` is a complete, standalone book.
 
-Re-run the exact same command whenever you want another book (just change the id). `--cookies` keeps itself up to date on every run (see below), so in practice you'll only need to re-export from the browser once in a while, not before every download.
+Re-run the exact same command whenever you want another book (just change the id), or to rebuild the same book after a partial failure. Cached files are reused automatically:
+
+```
+   downloading 342 files (concurrency=8, cache=.oreilly_cache/9781633437777)
+     342/342 files (342 from cache)
+   reused 342/342 files from cache
+   created 9781633437777.epub
+```
+
+`--cookies` keeps itself up to date on every run (see below), so in practice you'll only need to re-export from the browser once in a while, not before every download.
 
 ## Command-line reference
 
@@ -73,6 +93,9 @@ python3 oreilly_downloader.py BOOK_ID [options]
 | `--cookies PATH` | Path to a JSON file of learning.oreilly.com's cookies. The recommended way to authenticate — see [Authentication](#authentication) below. |
 | `--jwt VALUE` | Just the `orm-jwt` cookie's value, as a quick one-off alternative to `--cookies`. Expires within about an hour and can't be refreshed — fine for a single small book, not for anything that might outlive it. |
 | `--concurrency N` | How many files to download in parallel. Default: `8`. Lower this if you see a lot of `403` failures on a large book — it usually means the API's rate limiting is kicking in. |
+| `--cache-dir PATH` | Directory for caching raw API file bytes so a re-run only fetches what is still missing. Default: `.oreilly_cache/<book_id>/`. |
+| `--force` | Ignore the on-disk cache and re-download every file. The `.epub` is always rebuilt either way; this only forces fresh network fetches. |
+| `--no-nav` | Do not synthesise an EPUB3 `nav.xhtml` from the NCX. By default a nav document is generated when the package only has an EPUB2 NCX, so modern readers get a working table of contents. |
 | `--webview` | If there's no session yet, or the one you gave fails outright, open a real browser window so you can log in directly. See [Using `--webview`](#using---webview). |
 | `--webview-profile PATH` | Where `--webview` keeps its own persistent browser profile between runs. Defaults to a folder next to `--cookies`. |
 | `-h`, `--help` | Show the built-in help (kept in sync with this document, and the source of truth if the two ever disagree). |
@@ -112,7 +135,7 @@ or
 
 If a failure shows up *and* that claim already says "expired," the message tells you plainly to re-export cookies from your browser. If the claim still shows time remaining, the message instead explains that this looks like Akamai rejecting the request itself, and suggests just trying again shortly — or using `--webview` (below) to get past it directly.
 
-A handful of `FAILED to download ...` lines at the very end, naming specific files, usually just means transient rate-limiting on a big book. Re-run the exact same command; already-downloaded files are re-fetched too (the script always rebuilds the `.epub` from scratch), but that's normally quick.
+A handful of `FAILED to download ...` lines at the very end, naming specific files, usually just means transient rate-limiting on a big book. Re-run the exact same command; files already in the cache are reused automatically (pass `--force` if you want everything fetched again from the network).
 
 ## Using `--webview`
 
@@ -162,18 +185,32 @@ and the resulting cookies are saved back to `--cookies` right away, so a future 
 
 `--webview-profile PATH` controls where the embedded browser keeps its own persistent profile (separate from `--cookies`) between runs — by default, a `.oreilly_webview_profile` folder next to your cookies file. This means logging in via `--webview` is normally a one-time thing, not something that happens on every run.
 
+## Cache and re-runs
+
+Raw API payloads are stored under `.oreilly_cache/<book_id>/` (override with `--cache-dir`). On a later run with the same book id:
+
+- Files already present and non-empty in the cache are **not** re-fetched.
+- Everything is still processed and packed into a fresh `.epub` (path rewriting, nav synthesis, Calibre cleanup, etc.).
+- Use `--force` to ignore the cache and download every file again.
+
+This makes recovering from a partial failure (a few rate-limited images, an expired JWT mid-run) much faster: fix auth if needed, re-run the same command, and only the missing pieces hit the network.
+
 ## How it works, briefly
 
 1. Lists every file in the book via O'Reilly's own API (paginating through all results before downloading anything).
-2. Downloads each file concurrently (bounded by `--concurrency`), retrying rate-limited or transiently-failed requests with backoff.
-3. Converts each HTML chapter to valid, self-contained XHTML: rewrites every internal link, image, and stylesheet reference from the API's absolute paths to correct relative ones, fixes up SVG-wrapped cover images, and patches over a few known HTML/XML interoperability quirks (embedded `<style>` content, XML namespace declarations) so the result renders correctly both in strict EPUB readers and in the more lenient parsers most real reading apps actually use.
-4. Packages everything into a proper EPUB container (`mimetype`, `META-INF/container.xml`, and the book's own package document) and writes it out atomically, so an interrupted run never leaves a corrupt half-written file behind.
+2. Downloads each file concurrently (bounded by `--concurrency`), writing raw bytes into the on-disk cache and retrying rate-limited or transiently-failed requests with backoff. Cached files are skipped unless `--force` is set.
+3. Converts each HTML/XHTML/HTM chapter to valid, self-contained XHTML: rewrites every internal link, image, and stylesheet reference from the API's absolute paths to correct relative ones, fixes up SVG-wrapped cover images, and patches over a few known HTML/XML interoperability quirks (embedded `<style>` content, XML namespace declarations) so the result renders correctly both in strict EPUB readers and in the more lenient parsers most real reading apps actually use.
+4. Rewrites CSS `url()` / `@import` references and NCX `src`/`href` attributes the same way; normalises OPF item `media-type` for content documents to `application/xhtml+xml`.
+5. If the package has an NCX but no EPUB3 nav document, synthesises `nav.xhtml` from the NCX, registers it in the package with `properties="nav"`, and sets the package version to 3.0 (NCX is retained for EPUB2 readers).
+6. Strips Calibre production metadata from the package document when present.
+7. Packages everything into a proper EPUB container (`mimetype`, `META-INF/container.xml`, and `EPUB/content.opf`) and writes it out atomically, so an interrupted run never leaves a corrupt half-written file behind.
 
 ## Limitations
 
 - This can't defeat Akamai's bot detection outright — `--webview` works around it by using a real browser, not by tricking the anti-bot system.
 - A cookie export only lasts as long as the underlying login session does. Once that's genuinely dead (not just the short-lived token), you need to log in again — either back in your regular browser, or via `--webview`.
 - Only works for books your account actually has access to; it downloads exactly what the API would already show you in the web reader; nothing more.
+- The on-disk cache is not size-capped; delete `.oreilly_cache/` (or a single book subdirectory) if you want to reclaim space.
 
 ## Contributing
 
