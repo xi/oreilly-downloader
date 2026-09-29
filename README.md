@@ -23,6 +23,23 @@ Before any usage, please read the [O'Reilly Terms of Service](https://learning.o
 - Strips Calibre production metadata from the package document when present (common on Manning/O'Reilly packages that were run through Calibre upstream).
 - Normalises OPF media-types for content documents to `application/xhtml+xml`, rewrites NCX `src`/`href` paths, and resolves references against the EPUB root after renaming the package to `content.opf`.
 
+The provided script primarily downloads HTML pages and can generate a raw EPUB file.
+
+#### Calibre EPUB conversion
+**Important**: since the script only download HTML pages and may create a raw EPUB, many of the CSS and XML/HTML directives may be wrong for an E-Reader. To ensure best quality of the output, I suggest you to always convert the `EPUB` obtained by the script to standard-`EPUB` with [Calibre](https://calibre-ebook.com/).
+You can also use the command-line version of Calibre with `ebook-convert`, e.g.:
+```bash
+$ ebook-convert "XXXX/safaribooks/Books/Test-Driven Development with Python 2nd Edition (9781491958698)/9781491958698.epub" "XXXX/safaribooks/Books/Test-Driven Development with Python 2nd Edition (9781491958698)/9781491958698_CLEAR.epub"
+```
+After the execution, you can read the `9781491958698_CLEAR.epub` in every E-Reader and delete all other files.
+
+The program offers also an option to ensure best compatibilities for who wants to export the `EPUB` to E-Readers like Amazon Kindle: `--kindle`, it blocks overflow on `table` and `pre` elements (see [example](#use-or-not-the---kindle-option)).  
+In this case, I suggest you to convert the `EPUB` to `AZW3` with Calibre or to `MOBI`, remember in this case to select `Ignore margins` in the conversion options:  
+  
+![Calibre IgnoreMargins](https://github.com/lorenzodifuccia/cloudflare/raw/master/Images/safaribooks/safaribooks_calibre_IgnoreMargins.png "Select Ignore margins")  
+
+thanks for your suggestions in your readme, lorenzodifuccia. https://github.com/lorenzodifuccia/safaribooks
+
 ## Requirements
 
 - Python 3.9+
