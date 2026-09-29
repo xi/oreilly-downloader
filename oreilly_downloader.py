@@ -16,11 +16,11 @@ QUICK START
        site" to cookies.json. You do not need to hand-pick which cookies;
        anything not scoped to oreilly.com is ignored automatically.
     3. Find the book's ID: it's the digits in the book's learning.oreilly.com
-       URL, e.g. for https://learning.oreilly.com/library/view/some-book/9781633437777/
-       the id is 9781633437777.
+       URL, e.g. for https://learning.oreilly.com/library/view/some-book/9781098148706/
+       the id is 9781098148706.
     4. Run:
-           python3 oreilly_downloader.py 9781633437777 --cookies cookies.json
-       This writes 9781633437777.epub in the current directory.
+           python3 oreilly_downloader.py 9781098148706 --cookies cookies.json
+       This writes 9781098148706.epub in the current directory.
 
     Re-run the exact same command whenever you need another book (with a
     different id) - --cookies keeps itself up to date (see below), so you
@@ -77,7 +77,7 @@ IF AUTHENTICATION FAILS
     display (X11/Wayland/macOS/Windows desktop); it will not work over a
     plain SSH terminal or inside a headless container. Combine with
     --cookies so the result is saved for next time rather than used once:
-        python3 oreilly_downloader.py 9781633437777 --cookies cookies.json --webview
+        python3 oreilly_downloader.py 9781098148706 --cookies cookies.json --webview
     --webview-profile controls where pywebview keeps its own persistent
     browser profile between runs (default: a folder next to --cookies), so
     in practice logging in is a one-time thing, not a per-run one.
@@ -103,21 +103,289 @@ import argparse
 import asyncio
 import base64
 import json
+import logging
 import os
 import posixpath
 import random
 import re
+import shutil
+import subprocess
 import sys
 import time
 import zipfile
 from pathlib import Path
 from urllib.parse import unquote
 
+# ---------------------------------------------------------------------------
+# Bootstrap: Python version + third-party deps (friendly errors, no traceback)
+# ---------------------------------------------------------------------------
+# Absolute floor — below this the language/stdlib is too old to bother.
+ABSOLUTE_MIN_PYTHON = (3, 7)
+# Recommended minimum this project targets. Below this: warning + confirm.
+RECOMMENDED_MIN_PYTHON = (3, 9)
+# Highest Python minor we regularly exercise. Newer: warning + confirm.
+MAX_TESTED_PYTHON = (3, 13)
+
+SUPPORTED_OS = ('Linux', 'Windows')
+# Official creator — please open a GitHub Issue here when reporting bugs:
+REPORT_URL = 'https://github.com/official-kandoamoa'
+CALIBRE_URL = 'https://calibre-ebook.com/'
+SCRIPT_VERSION = '1.2.0'
+
+
+def _die(msg, code=1):
+    print(msg, file=sys.stderr)
+    sys.exit(code)
+
+
+def report_hint():
+    """Short footer telling users how to report bugs."""
+    return (
+        f'  If you believe this is a bug, please open an Issue on GitHub:\n'
+        f'    {REPORT_URL}'
+    )
+
+
+def _redact_secrets(text):
+    """Mask JWT-like and long token strings before writing logs."""
+    if not text:
+        return text
+    # JWT: header.payload.sig
+    text = re.sub(
+        r'eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+',
+        '[REDACTED_JWT]',
+        text,
+    )
+    # Long opaque tokens (32+ url-safe chars)
+    text = re.sub(r'\b[A-Za-z0-9_-]{40,}\b', '[REDACTED_TOKEN]', text)
+    return text
+
+
+def _safe_args_for_log(args):
+    """argparse namespace → dict with secrets removed."""
+    d = dict(vars(args))
+    if d.get('jwt'):
+        d['jwt'] = '[REDACTED]'
+    return d
+
+
+def _assert_url_allowed(url):
+    """Reject requests to hosts outside CONFIG allowed_hosts."""
+    try:
+        host = (yarl.URL(url).host or '').lower()
+    except Exception:
+        raise RuntimeError(f'refusing request: unparseable URL {url!r}') from None
+    allowed = tuple(CONFIG.get('allowed_hosts') or ('oreilly.com',))
+    if not host or not any(host == h or host.endswith('.' + h) for h in allowed):
+        raise RuntimeError(
+            f'refusing request to unexpected host {host!r} (url={url!r}). '
+            f'Allowed suffixes: {allowed}'
+        )
+
+
+def _chmod_private(path, mode=None):
+    mode = mode if mode is not None else CONFIG.get('cookies_file_mode', 0o600)
+    try:
+        if mode and os.name != 'nt' and os.path.isfile(path):
+            os.chmod(path, mode)
+    except OSError:
+        pass
+
+
+def ask_continue(prompt, *, assume_yes=False):
+    """Ask the user to confirm. Returns True to continue, False to abort.
+
+    When assume_yes is True (e.g. --yes / non-interactive), skips the prompt
+    and continues. When stdin is not a TTY, refuses to continue unless
+    assume_yes is set.
+    """
+    if assume_yes:
+        print(f'{prompt} [auto-yes]')
+        return True
+    if not sys.stdin.isatty():
+        print(
+            f'{prompt}\n'
+            f'  error: non-interactive session — pass --yes to continue anyway, '
+            f'or run in a terminal.',
+            file=sys.stderr,
+        )
+        return False
+    try:
+        answer = input(f'{prompt} [y/N] ').strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return False
+    return answer in ('y', 'yes')
+
+
+def check_python_version(*, assume_yes=False):
+    have = '.'.join(str(x) for x in sys.version_info[:3])
+    abs_need = '.'.join(str(x) for x in ABSOLUTE_MIN_PYTHON)
+    rec_need = '.'.join(str(x) for x in RECOMMENDED_MIN_PYTHON)
+
+    if sys.version_info < ABSOLUTE_MIN_PYTHON:
+        _die(
+            f'error: Python {abs_need}+ is required (you have {have}).\n'
+            f'  This version is too old to run the script at all.\n'
+            f'  Install a newer Python, or:  uv run --python {rec_need} '
+            f'oreilly_downloader.py ...\n'
+            + report_hint()
+        )
+
+    if sys.version_info < RECOMMENDED_MIN_PYTHON:
+        print(
+            f'warning: Python {have} is below the recommended minimum '
+            f'({rec_need}+).\n'
+            f'  The script may fail or behave incorrectly. '
+            f'Upgrading is strongly advised.',
+            file=sys.stderr,
+        )
+        if not ask_continue(
+                'Continue with this older Python version anyway?',
+                assume_yes=assume_yes):
+            _die(
+                f'Aborted. Install Python {rec_need}+ (recommended) or pass --yes.\n'
+                + report_hint()
+            )
+
+    # Too new / untested
+    if sys.version_info[:2] > MAX_TESTED_PYTHON[:2]:
+        tested = '.'.join(str(x) for x in MAX_TESTED_PYTHON)
+        print(
+            f'warning: Python {have} is newer than the highest version this '
+            f'script was tested with ({tested}.x).\n'
+            f'  It may still work, but unexpected breakage is possible.',
+            file=sys.stderr,
+        )
+        if not ask_continue('Continue with this untested Python version?',
+                            assume_yes=assume_yes):
+            _die(
+                'Aborted. Install a tested Python version or pass --yes.\n'
+                + report_hint()
+            )
+
+
+def check_operating_system(*, assume_yes=False):
+    import platform
+    system = platform.system() or 'Unknown'
+    if system in SUPPORTED_OS:
+        return system
+    # macOS and others
+    print(
+        f'warning: operating system {system!r} is not in the supported set '
+        f'{SUPPORTED_OS}.\n'
+        f'  This script is optimized for Linux and Windows. Other systems '
+        f'are untested and may fail (paths, permissions, Calibre, webview).',
+        file=sys.stderr,
+    )
+    if not ask_continue(
+            f'Continue anyway on {system}?',
+            assume_yes=assume_yes):
+        _die(
+            'Aborted. Use Linux or Windows, or pass --yes to override.\n'
+            + report_hint()
+        )
+    return system
+
+
+def check_dependencies():
+    missing = []
+    for name in ('aiohttp', 'yarl', 'lxml'):
+        try:
+            __import__(name)
+        except ImportError:
+            missing.append(name)
+    if not missing:
+        return
+    pkgs = ' '.join(missing)
+    _die(
+        'error: missing required Python package(s): '
+        + ', '.join(missing)
+        + '\n\n'
+        '  Install with one of:\n'
+        f'    pip install {pkgs}\n'
+        f'    pip install {pkgs} --break-system-packages   # if pip complains\n'
+        f'    uv run oreilly_downloader.py ...             # auto-installs from\n'
+        '                                                 # the script metadata\n'
+    )
+
+
+# Absolute floor only at import time; recommended/too-new prompts run after
+# argparse so --yes can skip them.
+if sys.version_info < ABSOLUTE_MIN_PYTHON:
+    check_python_version(assume_yes=False)
+check_dependencies()
+
 import aiohttp
 import yarl
 from http.cookies import SimpleCookie
 from lxml import etree
 from lxml import html as lhtml
+
+log = logging.getLogger('oreilly_downloader')
+
+# =============================================================================
+# USER CONFIG — edit these defaults freely (CLI flags still override them)
+# =============================================================================
+# Paths are relative to the current working directory unless absolute.
+CONFIG = {
+    # Default cookies file when --cookies is omitted (None = require CLI)
+    'cookies_path': 'cookies.json',
+
+    # Default cache root (per-book subdirs are created under this)
+    'cache_dir': '.oreilly_cache',
+
+    # Parallel file downloads
+    'concurrency': 8,
+
+    # Default books list for batch-style runs (used by batch_download.sh;
+    # also accepted by this script via --books FILE)
+    'books_file': 'books.txt',
+
+    # Directory for crash / unknown-error logs
+    'error_log_dir': 'error_logs',
+
+    # When True, synthesise EPUB3 nav.xhtml from NCX if missing
+    'make_nav': True,
+
+    # When True, run Calibre EPUB→EPUB polish after each successful build
+    'calibre_polish': False,
+
+    # When True, package API bytes with no rewriting (archival)
+    'raw': False,
+
+    # Append this suffix to polished/raw outputs only when non-empty
+    # (leave '' for default naming: <id>.epub / <id>-raw.epub)
+    'output_suffix': '',
+
+    # Extra HTTP headers (merged over script defaults; rarely needed)
+    'extra_headers': {
+        # 'User-Agent': 'Mozilla/5.0 ...',
+    },
+
+    # --- security / robustness ---
+    # Total / connect / sock-read timeouts for HTTP (seconds)
+    'http_timeout_total': 120,
+    'http_timeout_connect': 30,
+    'http_timeout_sock_read': 90,
+    # Refuse a single response larger than this (bytes); 0 = no limit
+    'max_response_bytes': 80 * 1024 * 1024,  # 80 MiB per file
+    # Only allow downloads whose URL host ends with one of these
+    'allowed_hosts': ('oreilly.com', 'learning.oreilly.com'),
+    # chmod cookies file to owner-only when saving (Unix; no-op on some OS)
+    'cookies_file_mode': 0o600,
+    # Expected O'Reilly Learning API major version (path /api/vN/...)
+    'api_version': 2,
+    # Set False to skip the online/API probe (not recommended)
+    'check_connectivity': True,
+
+    # Persist CLI defaults here (cookies path, concurrency, etc.)
+    # Created/updated with --save-options
+    'options_file': '.oreilly_options.json',
+    # If True, write options_file after every successful run
+    'auto_save_options': False,
+}
+# =============================================================================
 
 BASE_URL = 'https://learning.oreilly.com'
 
@@ -134,7 +402,7 @@ HTML_EXTENSIONS = ('.html', '.xhtml', '.htm')
 # transient server errors.
 RETRYABLE_STATUSES = {403, 429, 500, 502, 503, 504}
 
-DEFAULT_CONCURRENCY = 8
+DEFAULT_CONCURRENCY = int(CONFIG.get('concurrency', 8))
 
 # DNS / connection drops are common on Termux and mobile networks.
 _NETWORK_ERRORS = (
@@ -218,10 +486,27 @@ async def get_with_retry(session, url, *, max_attempts=30, base_delay=3.0,
     consecutive_403 = 0
     for attempt in range(1, max_attempts + 1):
         try:
+            _assert_url_allowed(url)
             async with session.get(url) as r:
                 r.raise_for_status()
                 consecutive_403 = 0
-                data = await r.read()
+                # Stream with size cap when configured
+                max_bytes = int(CONFIG.get('max_response_bytes') or 0)
+                if max_bytes > 0:
+                    chunks = []
+                    total = 0
+                    async for chunk in r.content.iter_chunked(64 * 1024):
+                        total += len(chunk)
+                        if total > max_bytes:
+                            raise RuntimeError(
+                                f'Response for {url.split("/files/")[-1]} '
+                                f'exceeds max_response_bytes ({max_bytes}); '
+                                f'aborting to protect disk.'
+                            )
+                        chunks.append(chunk)
+                    data = b''.join(chunks)
+                else:
+                    data = await r.read()
                 if not data:
                     short = url.split('/files/')[-1] if '/files/' in url else url
                     if attempt == max_attempts:
@@ -274,13 +559,29 @@ async def get_with_retry(session, url, *, max_attempts=30, base_delay=3.0,
             await asyncio.sleep(delay)
 
 
-CONTAINER = b"""<?xml version="1.0"?>
-<container xmlns="urn:oasis:names:tc:opendocument:xmlns:container" version="1.0">
-    <rootfiles>
-        <rootfile full-path="EPUB/content.opf" media-type="application/oebps-package+xml"/>
-    </rootfiles>
-</container>
-"""  # noqa
+def _container_xml(opf_zip_path='EPUB/content.opf'):
+    """Build META-INF/container.xml pointing at the package document.
+
+    opf_zip_path is the path *inside the zip* (e.g. EPUB/content.opf or
+    EPUB/OEBPS/package.opf). Used by normal mode (always content.opf) and
+    --raw mode (whatever full_path the API listed for the .opf).
+    """
+    # Keep it minimal and deterministic — no pretty-print variance.
+    return (
+        b'<?xml version="1.0"?>\n'
+        b'<container xmlns="urn:oasis:names:tc:opendocument:xmlns:container" '
+        b'version="1.0">\n'
+        b'    <rootfiles>\n'
+        b'        <rootfile full-path="'
+        + opf_zip_path.encode('utf-8')
+        + b'" media-type="application/oebps-package+xml"/>\n'
+        b'    </rootfiles>\n'
+        b'</container>\n'
+    )
+
+
+# Default container for the processed (non-raw) build.
+CONTAINER = _container_xml('EPUB/content.opf')
 
 _CSS_URL_RE = re.compile(r'''url\(\s*(?P<q>['"]?)(?P<url>[^'")]+)(?P=q)\s*\)''')
 _CSS_IMPORT_RE = re.compile(r'''@import\s+(?P<q>['"])(?P<url>[^'"]+)(?P=q)''')
@@ -399,7 +700,7 @@ _OPF_NS = 'http://www.idpf.org/2007/opf'
 _DC_NS = 'http://purl.org/dc/elements/1.1/'
 
 # Default on-disk cache for raw API payloads (resume support).
-DEFAULT_CACHE_DIR = '.oreilly_cache'
+DEFAULT_CACHE_DIR = CONFIG.get('cache_dir', '.oreilly_cache')
 
 # Fixed path of the synthesised EPUB3 nav document inside the EPUB.
 NAV_PATH = 'nav.xhtml'
@@ -1057,6 +1358,136 @@ def _best_jwt_from_jar(session):
     return best_val
 
 
+
+async def check_site_online(session):
+    """Return (online: bool, detail: str) for learning.oreilly.com reachability."""
+    url = BASE_URL + '/'
+    try:
+        _assert_url_allowed(url)
+        async with session.get(
+            url,
+            allow_redirects=True,
+            timeout=aiohttp.ClientTimeout(total=20, connect=10),
+        ) as r:
+            # Any HTTP response means the host is reachable (even 403/503).
+            if r.status >= 500:
+                return False, f'site returned HTTP {r.status} (server error)'
+            return True, f'site reachable (HTTP {r.status})'
+    except aiohttp.ClientConnectorError as exc:
+        return False, f'cannot connect — offline or DNS failure ({exc})'
+    except aiohttp.ServerTimeoutError:
+        return False, 'connection timed out — network slow or site down'
+    except asyncio.TimeoutError:
+        return False, 'connection timed out — network slow or site down'
+    except OSError as exc:
+        return False, f'network error ({type(exc).__name__}: {exc})'
+    except Exception as exc:  # noqa: BLE001
+        return False, f'unexpected connectivity error ({type(exc).__name__}: {exc})'
+
+
+async def check_api_available(session, api_version=None):
+    """Probe whether O'Reilly Learning API vN still exists.
+
+    A 401/403 from the API is treated as *available* (auth required).
+    A 404 on the version root suggests the API path changed.
+    Connection failures mean offline / blocked.
+    Returns (ok: bool, detail: str).
+    """
+    ver = int(api_version if api_version is not None
+              else CONFIG.get('api_version', 2))
+    # Prefer a lightweight authenticated-area path; without cookies this
+    # typically returns 401/403, which still proves the route exists.
+    probes = [
+        f'{BASE_URL}/api/v{ver}/',
+        f'{BASE_URL}/api/v{ver}/epubs/',
+    ]
+    last_detail = 'no probe attempted'
+    for url in probes:
+        try:
+            _assert_url_allowed(url)
+            async with session.get(
+                url,
+                allow_redirects=True,
+                timeout=aiohttp.ClientTimeout(total=20, connect=10),
+            ) as r:
+                status = r.status
+                if status == 404:
+                    last_detail = (
+                        f'API v{ver} probe {url!r} returned 404 — the '
+                        f'API path may have changed'
+                    )
+                    continue
+                if status >= 500:
+                    return False, (
+                        f'API v{ver} returned HTTP {status} (server error) '
+                        f'at {url}'
+                    )
+                # 200 / 301 / 401 / 403 / 405 etc. → route exists
+                return True, (
+                    f'API v{ver} reachable at {url} (HTTP {status})'
+                )
+        except aiohttp.ClientConnectorError as exc:
+            return False, f'cannot reach API — offline or DNS failure ({exc})'
+        except (aiohttp.ServerTimeoutError, asyncio.TimeoutError):
+            return False, 'API probe timed out — network slow or site down'
+        except OSError as exc:
+            return False, f'API network error ({type(exc).__name__}: {exc})'
+        except Exception as exc:  # noqa: BLE001
+            last_detail = f'API probe error ({type(exc).__name__}: {exc})'
+    return False, last_detail
+
+
+async def run_connectivity_checks(session_headers, *, assume_yes=False):
+    """Fail fast when offline or when API vN looks gone.
+
+    Prints status lines. Returns None on success; calls _die / prompts on failure.
+    """
+    if not CONFIG.get('check_connectivity', True):
+        print('note: connectivity checks disabled in CONFIG')
+        return
+
+    api_ver = int(CONFIG.get('api_version', 2))
+    timeout = aiohttp.ClientTimeout(total=25, connect=10)
+    async with aiohttp.ClientSession(
+        headers=session_headers,
+        timeout=timeout,
+        raise_for_status=False,
+    ) as session:
+        print('Checking network / site …')
+        online, site_detail = await check_site_online(session)
+        if not online:
+            print(f'  site: OFFLINE — {site_detail}', file=sys.stderr)
+            _die(
+                'error: cannot reach learning.oreilly.com.\\n'
+                '  Check your internet connection, VPN, or firewall.\\n'
+                '  If the site is up in a browser but not here, DNS or TLS\\n'
+                '  interception may be blocking this script.\\n'
+                + report_hint()
+            )
+        print(f'  site: online — {site_detail}')
+
+        print(f'Checking O\'Reilly API v{api_ver} …')
+        api_ok, api_detail = await check_api_available(session, api_ver)
+        if not api_ok:
+            print(f'  api: UNAVAILABLE — {api_detail}', file=sys.stderr)
+            print(
+                f'  This script expects API version {api_ver} '
+                f'(/api/v{api_ver}/epubs/...).\\n'
+                f'  O\'Reilly may have changed or removed this API.\\n'
+                f'  Open an Issue if the site works in a browser but this '
+                f'check keeps failing:\\n'
+                f'    {REPORT_URL}',
+                file=sys.stderr,
+            )
+            if not ask_continue(
+                    'Continue anyway? Downloads will likely fail.',
+                    assume_yes=assume_yes):
+                _die('Aborted due to API availability check.\\n' + report_hint())
+            print('  continuing despite API check failure …')
+        else:
+            print(f'  api: ok — {api_detail}')
+
+
 async def check_auth(session, *, max_attempts=5):
     """Probe the preferences endpoint and report whether the session is
     authenticated.
@@ -1128,11 +1559,32 @@ def _safe_cache_path(cache_root, full_path):
 
 
 async def fetch_book(book_id, zfh, session, concurrency=DEFAULT_CONCURRENCY,
-                     cache_dir=None, force=False, make_nav=True):
+                     cache_dir=None, force=False, make_nav=True, raw=False):
+    """Download every file listed for the book and write them into zfh.
+
+    Normal mode (raw=False):
+      - rewrite HTML/CSS/OPF/NCX so internal links resolve inside the zip
+      - rename the package document to content.opf
+      - optionally synthesise EPUB3 nav.xhtml from NCX
+      - ensure dcterms:modified on the OPF
+
+    Raw mode (raw=True):
+      - write every file's bytes *exactly* as the API returned them
+      - keep original full_path names (no content.opf rename)
+      - no link rewriting, no nav, no metadata injection
+      - container.xml points at the OPF path the API actually used
+      - still wraps files under EPUB/ with a standard mimetype entry so
+        the zip is a valid EPUB package container (the files themselves
+        are untouched)
+    """
     root_path = f'/api/v2/epubs/urn:orm:book:{book_id}/files/'
 
+    # mimetype must be first and uncompressed (EPUB spec). container.xml is
+    # written later in raw mode once we know the real OPF path; in normal
+    # mode it always points at EPUB/content.opf.
     zfh.writestr('mimetype', b'application/epub+zip', compress_type=zipfile.ZIP_STORED)
-    zfh.writestr('META-INF/container.xml', CONTAINER)
+    if not raw:
+        zfh.writestr('META-INF/container.xml', CONTAINER)
 
     # Collect the *complete* file listing across every paginated results page
     # up front, before downloading anything. We need the full set of
@@ -1152,9 +1604,9 @@ async def fetch_book(book_id, zfh, session, concurrency=DEFAULT_CONCURRENCY,
     cache_root.mkdir(parents=True, exist_ok=True)
 
     failed = []
-    # Processed members keyed by path inside the EPUB/ folder (e.g.
-    # 'content.opf', 'OEBPS/Text/01.htm'). Built fully before writing so
-    # we can synthesise nav.xhtml and patch the OPF afterward.
+    # Members keyed by path inside the EPUB/ folder (e.g. 'content.opf',
+    # 'OEBPS/Text/01.htm'). Built fully before writing so we can synthesise
+    # nav.xhtml and patch the OPF afterward (skipped entirely in --raw).
     # Mutations happen under progress_lock so concurrent tasks never interleave
     # dict/list updates even if this is later driven by multiple threads.
     members = {}
@@ -1209,37 +1661,38 @@ async def fetch_book(book_id, zfh, session, concurrency=DEFAULT_CONCURRENCY,
                         # a successful download.
                         print(f'  warning: could not cache {full_path}: {exc}')
 
-        # Processing runs *outside* the download semaphore so CPU-bound
-        # XHTML rewriting does not stall other network fetches. A processing
-        # failure must not take down the whole gather — only this file.
+        # --raw: keep API bytes and original path, zero transformation.
         out_path = full_path
-        try:
-            if full_path.endswith(HTML_EXTENSIONS):
-                content = to_xhtml(content, root_path, full_path, css_paths)
-            elif full_path.endswith('.css'):
-                content = rewrite_css(content, root_path, full_path)
-            elif full_path.endswith('.opf'):
-                content = rewrite_opf(content, root_path, full_path)
-                # The API doesn't always name the package document
-                # "content.opf" (e.g. it may be "9780138308667.opf") but
-                # container.xml always points at "EPUB/content.opf".
-                out_path = 'content.opf'
-            elif full_path.endswith('.ncx'):
-                content = rewrite_ncx(content, root_path, full_path)
-        except Exception as exc:  # noqa: BLE001 - skip just this file
-            print(f'FAILED to process {full_path}: {exc!r}')
-            # Drop the cache entry so a later re-run refetches after the
-            # server (or our rewriter) recovers, instead of replaying poison.
+        if not raw:
+            # Processing runs *outside* the download semaphore so CPU-bound
+            # XHTML rewriting does not stall other network fetches.
             try:
-                if cache_path.is_file():
-                    cache_path.unlink()
-                    print(f'  removed bad cache entry for {full_path}')
-            except OSError:
-                pass
-            async with progress_lock:
-                failed.append(full_path)
-                done += 1
-            return
+                if full_path.endswith(HTML_EXTENSIONS):
+                    content = to_xhtml(content, root_path, full_path, css_paths)
+                elif full_path.endswith('.css'):
+                    content = rewrite_css(content, root_path, full_path)
+                elif full_path.endswith('.opf'):
+                    content = rewrite_opf(content, root_path, full_path)
+                    # The API doesn't always name the package document
+                    # "content.opf" (e.g. it may be "9780138308667.opf") but
+                    # container.xml always points at "EPUB/content.opf".
+                    out_path = 'content.opf'
+                elif full_path.endswith('.ncx'):
+                    content = rewrite_ncx(content, root_path, full_path)
+            except Exception as exc:  # noqa: BLE001 - skip just this file
+                print(f'FAILED to process {full_path}: {exc!r}')
+                # Drop the cache entry so a later re-run refetches after the
+                # server (or our rewriter) recovers, instead of replaying poison.
+                try:
+                    if cache_path.is_file():
+                        cache_path.unlink()
+                        print(f'  removed bad cache entry for {full_path}')
+                except OSError:
+                    pass
+                async with progress_lock:
+                    failed.append(full_path)
+                    done += 1
+                return
 
         async with progress_lock:
             members[out_path] = content
@@ -1255,39 +1708,54 @@ async def fetch_book(book_id, zfh, session, concurrency=DEFAULT_CONCURRENCY,
     # a clean error. Cap how many requests are in flight at once.
     sem = asyncio.Semaphore(max(1, concurrency))
 
-    print(f'downloading {total} files (concurrency={concurrency}'
+    mode = 'raw (no rewriting)' if raw else 'processed'
+    print(f'downloading {total} files [{mode}] (concurrency={concurrency}'
           f', cache={cache_root}'
           + (', force re-fetch' if force else '')
           + ')')
     await asyncio.gather(*[download(result, sem) for result in results])
 
-    if 'content.opf' not in members:
-        raise RuntimeError(
-            'Package document (content.opf) missing after download — '
-            'cannot build a valid EPUB. Re-run with a live session; if the '
-            'OPF keeps failing, try --force to bypass a bad cache entry.'
-        )
+    if raw:
+        # Locate the package document under its original API path.
+        opf_members = [p for p in members if p.endswith('.opf')]
+        if not opf_members:
+            raise RuntimeError(
+                'No .opf package document in the API listing — cannot build '
+                'even a raw EPUB. Re-run with a live session.'
+            )
+        # Prefer a top-level *.opf; otherwise first match.
+        opf_path = next((p for p in opf_members if '/' not in p), opf_members[0])
+        zfh.writestr('META-INF/container.xml',
+                     _container_xml(f'EPUB/{opf_path}'))
+        print(f'  raw mode: container.xml → EPUB/{opf_path}')
+    else:
+        if 'content.opf' not in members:
+            raise RuntimeError(
+                'Package document (content.opf) missing after download — '
+                'cannot build a valid EPUB. Re-run with a live session; if the '
+                'OPF keeps failing, try --force to bypass a bad cache entry.'
+            )
 
-    # --- EPUB3 nav from NCX (when the package has no nav of its own) -----
-    if make_nav:
-        ncx_path = next((p for p in members if p.endswith('.ncx')), None)
-        already_has_nav = any(
-            p.lower().endswith(('nav.xhtml', 'nav.html')) for p in members
-        )
-        if ncx_path and not already_has_nav:
-            nav_bytes = generate_nav_from_ncx(members[ncx_path], ncx_path)
-            if nav_bytes:
-                members[NAV_PATH] = nav_bytes
-                members['content.opf'] = finalize_opf(
-                    members['content.opf'],
-                    nav_path=NAV_PATH,
-                    bump_to_epub3=True,
-                )
-                print(f'  added EPUB3 nav.xhtml (from {ncx_path})')
-        else:
-            # No nav to inject (or one already present); still run finalize
-            # for any future hooks / consistency.
-            members['content.opf'] = finalize_opf(members['content.opf'])
+        # --- EPUB3 nav from NCX (when the package has no nav of its own) -----
+        if make_nav:
+            ncx_path = next((p for p in members if p.endswith('.ncx')), None)
+            already_has_nav = any(
+                p.lower().endswith(('nav.xhtml', 'nav.html')) for p in members
+            )
+            if ncx_path and not already_has_nav:
+                nav_bytes = generate_nav_from_ncx(members[ncx_path], ncx_path)
+                if nav_bytes:
+                    members[NAV_PATH] = nav_bytes
+                    members['content.opf'] = finalize_opf(
+                        members['content.opf'],
+                        nav_path=NAV_PATH,
+                        bump_to_epub3=True,
+                    )
+                    print(f'  added EPUB3 nav.xhtml (from {ncx_path})')
+            else:
+                # No nav to inject (or one already present); still run finalize
+                # for dcterms:modified / future hooks.
+                members['content.opf'] = finalize_opf(members['content.opf'])
 
     # Single-threaded write after gather — ZipFile is not concurrent-safe.
     for out_path, content in members.items():
@@ -1482,6 +1950,8 @@ def save_cookies(path, records, session):
 
     with open(path, 'w') as f:
         json.dump(list(merged.values()), f, indent=2)
+    # Restrict permissions so other users on the machine cannot read tokens
+    _chmod_private(path)
 
 
 def get_cookies_via_webview(profile_dir, start_url=None, timeout_minutes=10):
@@ -1565,8 +2035,437 @@ def get_cookies_via_webview(profile_dir, start_url=None, timeout_minutes=10):
     return result['cookies']
 
 
+
+def setup_logging(log_file=None, verbose=False):
+    """Configure root logger for this script.
+
+    --verbose → INFO on stderr; --log FILE → DEBUG to that file (and INFO
+    on stderr if verbose, else WARNING on stderr only).
+    """
+    root = logging.getLogger()
+    # Avoid duplicate handlers if called twice
+    root.handlers.clear()
+    root.setLevel(logging.DEBUG)
+
+    fmt = logging.Formatter(
+        '%(asctime)s %(levelname)-7s %(message)s',
+        datefmt='%H:%M:%S',
+    )
+    console = logging.StreamHandler(sys.stderr)
+    console.setFormatter(fmt)
+    if verbose:
+        console.setLevel(logging.INFO)
+    else:
+        console.setLevel(logging.WARNING)
+    root.addHandler(console)
+
+    if log_file:
+        try:
+            parent = os.path.dirname(os.path.abspath(log_file))
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            fh = logging.FileHandler(log_file, encoding='utf-8')
+            fh.setLevel(logging.DEBUG)
+            fh.setFormatter(logging.Formatter(
+                '%(asctime)s %(levelname)-7s [%(name)s] %(message)s',
+                datefmt='%Y-%m-%d %H:%M:%S',
+            ))
+            root.addHandler(fh)
+            log.info('logging to %s', log_file)
+        except OSError as exc:
+            _die(
+                f'error: cannot write log file {log_file!r}: {exc}\n'
+                f'  Check the path exists and you have write permission '
+                f'(storage permission on Android/Termux?).'
+            )
+
+
+def ensure_writable_dir(dir_path, label):
+    """Create dir if needed and verify we can write a probe file. Exit on failure."""
+    dir_path = os.path.abspath(dir_path)
+    try:
+        os.makedirs(dir_path, exist_ok=True)
+    except OSError as exc:
+        _die(
+            f'error: cannot create {label} directory {dir_path!r}: {exc}\n'
+            f'  Permission denied or path inaccessible — on Android/Termux, '
+            f'grant storage permission or pick a path under $HOME.'
+        )
+    probe = os.path.join(dir_path, '.oreilly_write_test')
+    try:
+        with open(probe, 'w') as f:
+            f.write('ok')
+        os.unlink(probe)
+    except OSError as exc:
+        _die(
+            f'error: cannot write to {label} directory {dir_path!r}: {exc}\n'
+            f'  Permission denied or read-only filesystem — check storage '
+            f'permissions or free space.'
+        )
+    log.debug('writable %s dir: %s', label, dir_path)
+    return dir_path
+
+
+def ensure_writable_file_parent(file_path, label):
+    """Ensure the parent directory of a file path is writable."""
+    parent = os.path.dirname(os.path.abspath(file_path)) or '.'
+    return ensure_writable_dir(parent, label)
+
+
+def polish_with_calibre(epub_path, *, required=False):
+
+    """Run Calibre ebook-convert EPUB→EPUB to normalise the package.
+
+    Produces a reader-friendly EPUB (fixed structure, media types, TOC, etc.).
+    Returns the path of the polished file on success, or None if Calibre is
+    missing / conversion failed. Never raises — missing Calibre is not fatal.
+
+    When running as root, sets QTWEBENGINE_DISABLE_SANDBOX=1 (required by
+    Qt WebEngine).
+    """
+    epub_path = os.path.abspath(epub_path)
+    if not os.path.isfile(epub_path):
+        print(f'  calibre: skip — {epub_path} not found')
+        return None
+
+    ebook_convert = shutil.which('ebook-convert')
+    if not ebook_convert:
+        msg = (
+            'calibre: ebook-convert not found on PATH — cannot polish.\n'
+            f'  Install Calibre from the official site: {CALIBRE_URL}\n'
+            '  After installing, ensure "ebook-convert" is on your PATH, '
+            'or omit --calibre.'
+        )
+        if required:
+            _die('error: ' + msg)
+        print('  ' + msg + '\n  Download kept without polish.')
+        log.warning(msg)
+        return None
+
+    # Write to a sibling temp, then replace — ebook-convert refuses in==out.
+    base, ext = os.path.splitext(epub_path)
+    polished = f'{base}.calibre{ext or ".epub"}'
+    env = os.environ.copy()
+    if os.geteuid() == 0:
+        env['QTWEBENGINE_DISABLE_SANDBOX'] = '1'
+
+    print(f'  calibre: polishing {os.path.basename(epub_path)} → '
+          f'{os.path.basename(polished)} …')
+    try:
+        proc = subprocess.run(
+            [ebook_convert, epub_path, polished],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=3600,
+        )
+    except FileNotFoundError:
+        print('  calibre: ebook-convert disappeared from PATH — skip')
+        return None
+    except subprocess.TimeoutExpired:
+        print('  calibre: ebook-convert timed out after 1h — skip')
+        try:
+            if os.path.isfile(polished):
+                os.unlink(polished)
+        except OSError:
+            pass
+        return None
+
+    if proc.returncode != 0 or not os.path.isfile(polished):
+        err = (proc.stderr or proc.stdout or '').strip().splitlines()
+        tail = err[-5:] if err else ['(no output)']
+        print(f'  calibre: conversion failed (exit {proc.returncode}):')
+        for line in tail:
+            print(f'    {line}')
+        try:
+            if os.path.isfile(polished):
+                os.unlink(polished)
+        except OSError:
+            pass
+        return None
+
+    # Replace the original with the polished build; keep a .orig backup only
+    # if replace fails mid-way (atomic replace when possible).
+    try:
+        os.replace(polished, epub_path)
+    except OSError as exc:
+        print(f'  calibre: could not replace {epub_path}: {exc}')
+        print(f'  calibre: polished file left at {polished}')
+        return polished
+
+    print(f'  calibre: polished EPUB ready → {epub_path}')
+    return epub_path
+
+
+
+def write_error_log(exc, *, context=''):
+    """Write an unknown/unexpected error to error_logs/error_log_YYYY_MM_DD_HHMMSS.log.
+
+    Returns the path written, or None on failure.
+    """
+    import traceback
+    from datetime import datetime
+
+    log_dir = CONFIG.get('error_log_dir') or 'error_logs'
+    try:
+        os.makedirs(log_dir, exist_ok=True)
+    except OSError as e:
+        print(f'warning: could not create error log dir {log_dir!r}: {e}',
+              file=sys.stderr)
+        log_dir = '.'
+
+    stamp = datetime.now().strftime('%Y_%m_%d_%H%M%S')
+    path = os.path.join(log_dir, f'error_log_{stamp}.log')
+    try:
+        with open(path, 'w', encoding='utf-8') as f:
+            f.write(f'time: {datetime.now().isoformat(timespec="seconds")}\n')
+            f.write(f'python: {sys.version}\n')
+            f.write(f'script_version: {SCRIPT_VERSION}\n')
+            # Redact secrets from argv / exception text / traceback
+            f.write(_redact_secrets(f'argv: {sys.argv!r}\n'))
+            if context:
+                f.write(_redact_secrets(f'context: {context}\n'))
+            f.write(f'error_type: {type(exc).__name__}\n')
+            f.write(_redact_secrets(f'error: {exc!r}\n\n'))
+            f.write('traceback:\n')
+            tb = ''.join(traceback.format_exception(
+                type(exc), exc, exc.__traceback__))
+            f.write(_redact_secrets(tb))
+        _chmod_private(path)
+        print(f'error: unexpected failure ({type(exc).__name__}: {exc})',
+              file=sys.stderr)
+        print(f'  details saved to {path}', file=sys.stderr)
+        print(
+            '  If this looks like a bug, please open an Issue on GitHub:\n'
+            f'    {REPORT_URL}',
+            file=sys.stderr,
+        )
+        log.exception('unexpected error (saved to %s)', path)
+        return path
+    except OSError as e:
+        print(f'error: unexpected failure ({type(exc).__name__}: {exc})',
+              file=sys.stderr)
+        print(f'  and could not write error log: {e}', file=sys.stderr)
+        print(
+            '  Please open an Issue on GitHub:\n'
+            f'    {REPORT_URL}',
+            file=sys.stderr,
+        )
+        return None
+
+
+def parse_books_file(path):
+    """Parse books.txt / sources.txt lines: BOOK_ID or BOOK_ID # title.
+
+    Yields (book_id, title_or_empty). Skips blank/full-line comments.
+    Invalid lines are reported to stderr and skipped.
+    """
+    with open(path, encoding='utf-8') as f:
+        for lineno, raw in enumerate(f, 1):
+            line = raw.strip()
+            if not line or line.startswith('#'):
+                continue
+            if line.count('#') > 1:
+                print(f'error: {path}:{lineno}: only one # separator allowed: {raw.rstrip()}',
+                      file=sys.stderr)
+                continue
+            if '#' in line:
+                book_id, title = line.split('#', 1)
+                book_id, title = book_id.strip(), title.strip()
+                if (title.startswith('"') and title.endswith('"')) or (
+                        title.startswith("'") and title.endswith("'")):
+                    title = title[1:-1].strip()
+            else:
+                book_id, title = line, ''
+            if not book_id.isdigit():
+                print(f'error: {path}:{lineno}: book id must be digits only: {raw.rstrip()}',
+                      file=sys.stderr)
+                continue
+            yield book_id, title
+
+
+
+def _validate_cli_args(args):
+    """Reject invalid option values / formats before any network I/O."""
+    errors = []
+
+    if args.book_id is not None and not str(args.book_id).isdigit():
+        errors.append(
+            f'book id must be digits only (ISBN-style), got {args.book_id!r}'
+        )
+
+    if args.concurrency is not None:
+        if not isinstance(args.concurrency, int) or args.concurrency < 1:
+            errors.append(
+                f'--concurrency must be an integer >= 1, got {args.concurrency!r}'
+            )
+        elif args.concurrency > 64:
+            errors.append(
+                f'--concurrency {args.concurrency} is too high (max 64); '
+                f'large values often trigger rate limits'
+            )
+
+    if args.cookies is not None:
+        p = args.cookies
+        if p != '-' and os.path.isdir(p):
+            errors.append(f'--cookies points to a directory, not a file: {p!r}')
+
+    if args.books is not None and not os.path.isfile(args.books):
+        # Allow CONFIG auto-detect path missing only when user did not pass --books
+        # Here args.books is set explicitly or from CONFIG file existence.
+        if not os.path.exists(args.books):
+            errors.append(f'books file not found: {args.books!r}')
+        elif not os.path.isfile(args.books):
+            errors.append(f'books path is not a file: {args.books!r}')
+
+    if args.cache_dir is not None and os.path.exists(args.cache_dir) and not os.path.isdir(args.cache_dir):
+        errors.append(f'--cache-dir is not a directory: {args.cache_dir!r}')
+
+    if args.output_dir is not None and os.path.exists(args.output_dir) and not os.path.isdir(args.output_dir):
+        errors.append(f'--output-dir is not a directory: {args.output_dir!r}')
+
+    if args.log is not None and os.path.isdir(args.log):
+        errors.append(f'--log points to a directory, not a file: {args.log!r}')
+
+    if args.raw and args.no_nav:
+        # not fatal — no_nav is ignored in raw mode; just note
+        print(
+            'note: --no-nav is ignored when --raw is set '
+            '(raw mode never synthesises nav).',
+            file=sys.stderr,
+        )
+
+    if errors:
+        for e in errors:
+            print(f'error: {e}', file=sys.stderr)
+        print('  Fix the option/format and try again.', file=sys.stderr)
+        print(report_hint(), file=sys.stderr)
+        sys.exit(2)
+
+
+
+
+# Keys we persist in the options file (no secrets like jwt values).
+_SAVED_OPTION_KEYS = (
+    'cookies', 'concurrency', 'cache_dir', 'output_dir', 'books',
+    'webview_profile', 'log', 'raw', 'calibre', 'no_nav', 'force',
+    'verbose', 'skip_connectivity',
+)
+
+
+def load_saved_options(path=None):
+    """Load persisted CLI defaults from JSON. Returns a dict (possibly empty)."""
+    path = path or CONFIG.get('options_file') or '.oreilly_options.json'
+    if not path or not os.path.isfile(path):
+        return {}
+    try:
+        with open(path, encoding='utf-8') as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            print(f'warning: options file {path!r} is not a JSON object — ignored',
+                  file=sys.stderr)
+            return {}
+        # Never load jwt from disk into defaults via this file
+        data.pop('jwt', None)
+        return data
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f'warning: could not read options file {path!r}: {exc}',
+              file=sys.stderr)
+        return {}
+
+
+def save_options(args, path=None):
+    """Write selected CLI options to the options file (no secrets)."""
+    path = path or CONFIG.get('options_file') or '.oreilly_options.json'
+    data = {}
+    for key in _SAVED_OPTION_KEYS:
+        if not hasattr(args, key):
+            continue
+        val = getattr(args, key)
+        # Skip empty / False for flags? Keep explicit False so user can persist off
+        if val is None:
+            continue
+        if key in ('log',) and not val:
+            continue
+        data[key] = val
+    try:
+        parent = os.path.dirname(os.path.abspath(path))
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump(data, f, indent=2, sort_keys=True)
+            f.write('\n')
+        _chmod_private(path)
+        print(f'saved options to {path}')
+        log.info('saved options to %s: %s', path, data)
+        return path
+    except OSError as exc:
+        print(f'warning: could not save options to {path!r}: {exc}',
+              file=sys.stderr)
+        return None
+
+
+def print_quick_reference():
+    """Short usage card when the script is run with no arguments."""
+    prog = 'oreilly_downloader.py'
+    lines = [
+        f"O'Reilly EPUB downloader  v{SCRIPT_VERSION}",
+        "Download books you have access to on learning.oreilly.com as standalone EPUBs.",
+        "",
+        "Quick start",
+        "  1. Log in at https://learning.oreilly.com",
+        "  2. Export cookies for the site to cookies.json  (Cookie-Editor, etc.)",
+        "  3. Run:",
+        f"       python3 {prog} BOOK_ID --cookies cookies.json",
+        "",
+        "Examples",
+        f"  python3 {prog} 9781098148706 --cookies cookies.json",
+        f"  python3 {prog} 9781098148706 --cookies cookies.json --calibre",
+        f"  python3 {prog} --books books.txt --cookies cookies.json",
+        f"  python3 {prog} 9781098148706 --cookies cookies.json --raw --calibre",
+        f"  python3 {prog} --cookies cookies.json --webview",
+        "",
+        "Common options",
+        "  BOOK_ID              Digits from the book URL (.../9781098148706/)",
+        "  --cookies PATH       Browser cookie export (recommended)",
+        "  --books FILE         List of ids:  978... # \"Title\"",
+        "  --calibre            Polish EPUB with Calibre ebook-convert",
+        "  --raw                Package API files with no rewriting",
+        "  --webview            Log in via a real browser window",
+        "  --force              Ignore download cache",
+        "  --yes, -y            Skip safety prompts",
+        "  --verbose, -v        More console output",
+        "  --log PATH           Debug log file",
+        "  --save-options       Remember current flags (e.g. --cookies)",
+        "  --print-options      Show saved options file and exit",
+        "  --version            Print version",
+        "  -h, --help           Full detailed help",
+        "",
+        "books.txt format",
+        '  9781098148706 # "Math for Programmers"',
+        "  9781098148706",
+        "",
+        f"Need more detail?  Run:  python3 {prog} --help",
+        f"Report bugs:  {REPORT_URL}",
+    ]
+    print("\n".join(lines))
+
+
 async def amain():
-    parser = argparse.ArgumentParser(
+    # No arguments at all → quick reference (not an error)
+    if len(sys.argv) <= 1:
+        print_quick_reference()
+        sys.exit(0)
+
+    class _ArgParser(argparse.ArgumentParser):
+        def error(self, message):
+            print(f'error: invalid option or argument: {message}', file=sys.stderr)
+            print(f'  Quick reference:  python3 {self.prog}', file=sys.stderr)
+            print(f'  Full help:        python3 {self.prog} --help', file=sys.stderr)
+            print(report_hint(), file=sys.stderr)
+            sys.exit(2)
+
+    parser = _ArgParser(
         prog='oreilly_downloader.py',
         description=(
             "Download a book from O'Reilly learning as a standalone .epub "
@@ -1574,23 +2473,81 @@ async def amain():
             "full walkthrough of getting cookies.json set up."
         ),
         epilog=(
-            "example:\n"
-            "  python3 oreilly_downloader.py 9781633437777 --cookies cookies.json\n"
+            "----------------------------------------------------------------\n"
+            "DETAILED GUIDE\n"
+            "----------------------------------------------------------------\n"
             "\n"
-            "book_id is the digits in the book's learning.oreilly.com URL,\n"
-            "e.g. .../library/view/some-book/9781633437777/ -> 9781633437777.\n"
+            "BOOK ID\n"
+            "  From the book URL on learning.oreilly.com, e.g.\n"
+            "    https://learning.oreilly.com/library/view/some-book/9781098148706/\n"
+            "  -> book_id is 9781098148706 (digits only).\n"
             "\n"
-            "cookies.json: export all cookies for learning.oreilly.com with a\n"
-            "browser extension (Cookie-Editor, EditThisCookie, ...) while\n"
-            "logged in. This script reads that export directly and rewrites\n"
-            "the same file afterwards, so normally you only need to re-export\n"
-            "again once the whole login session has actually expired, not\n"
-            "before every single run."
+            "AUTHENTICATION\n"
+            "  --cookies PATH   Preferred. Export all cookies for\n"
+            "                   learning.oreilly.com while logged in\n"
+            "                   (Cookie-Editor / EditThisCookie). The file\n"
+            "                   is updated after each run.\n"
+            "  --jwt VALUE      Short-lived orm-jwt only; expires within ~1h.\n"
+            "  --webview        Open a real browser window to log in (needs\n"
+            "                   display + optional: pip install pywebview).\n"
+            "  Without cookies the script asks before continuing (partial EPUB\n"
+            "  risk). Use --yes to skip prompts in scripts.\n"
+            "\n"
+            "OUTPUT MODES\n"
+            "  (default)        Rewrite links/CSS/OPF into a self-contained EPUB.\n"
+            "  --raw            Store API bytes unchanged -> <id>-raw.epub.\n"
+            "  --calibre        After build, run Calibre ebook-convert (EPUB->EPUB).\n"
+            "                   Install from https://calibre-ebook.com/\n"
+            "  --no-nav         Do not synthesise EPUB3 nav.xhtml from NCX.\n"
+            "\n"
+            "BATCH / LISTS\n"
+            "  --books FILE     One book per line:\n"
+            '                     9781098148706 # "Title Here"\n'
+            "                     9781098148706\n"
+            "                   book_id must be digits; only one # separator.\n"
+            "  --output-dir DIR Write EPUBs into DIR.\n"
+            "\n"
+            "CACHE & NETWORK\n"
+            "  --cache-dir PATH Raw API cache (default .oreilly_cache/<id>/).\n"
+            "  --force          Re-download everything (ignore cache).\n"
+            "  --concurrency N  Parallel downloads (default 8, max 64).\n"
+            "  --skip-connectivity  Skip site/API v2 online checks.\n"
+            "\n"
+            "DEBUG & SAFETY\n"
+            "  --log PATH       DEBUG log file (secrets redacted).\n"
+            "  -v, --verbose    INFO messages on stderr.\n"
+            "  -y, --yes        Auto-answer yes to safety prompts.\n"
+            "  --version        Print version and exit.\n"
+            "  --save-options   Remember flags like --cookies for next run.\n"
+            "  --print-options  Show saved options file and exit.\n"
+            "\n"
+            "SAVED OPTIONS\n"
+            "  Common flags can be stored in .oreilly_options.json (CONFIG\n"
+            "  options_file). Example:\n"
+            '    python3 oreilly_downloader.py --cookies cookies.json '
+            '--save-options\n'
+            "  Later runs pick those up as defaults; CLI still overrides.\n"
+            "  --jwt is never saved.\n"
+            "\n"
+            "CONFIG\n"
+            "  Edit the CONFIG dict near the top of this script for defaults\n"
+            "  (cookies path, cache, calibre_polish, api_version, timeouts, ...).\n"
+            "  CLI flags always override CONFIG.\n"
+            "\n"
+            "EXAMPLES\n"
+            "  python3 oreilly_downloader.py 9781098148706 --cookies cookies.json\n"
+            "  python3 oreilly_downloader.py 9781098148706 --cookies cookies.json --calibre\n"
+            "  python3 oreilly_downloader.py --books books.txt --cookies cookies.json\n"
+            "  python3 oreilly_downloader.py --cookies cookies.json --webview\n"
+            "\n"
+            "With no arguments this program prints a short quick reference.\n"
+            "Report bugs: https://github.com/official-kandoamoa\n"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument('book_id', help=(
-        "the numeric book id from the book's learning.oreilly.com URL"
+    parser.add_argument('book_id', nargs='?', default=None, help=(
+        "the numeric book id from the book's learning.oreilly.com URL. "
+        "Optional when --books FILE is set (or CONFIG books_file exists)."
     ))
     parser.add_argument('--jwt', help=(
         "Just the 'orm-jwt' cookie value. A quick one-off shortcut, but it "
@@ -1658,15 +2615,180 @@ async def amain():
     parser.add_argument('--no-nav', action='store_true', help=(
         "Do not synthesise an EPUB3 nav.xhtml from the NCX. By default a "
         "nav document is generated when the package only has an EPUB2 "
-        "NCX, so modern readers get a working table of contents."
+        "NCX, so modern readers get a working table of contents. "
+        "Ignored when --raw is set (raw mode never synthesises files)."
     ))
+    parser.add_argument('--raw', action='store_true', help=(
+        "Package the API files exactly as received — no HTML/CSS/OPF/NCX "
+        "rewriting, no content.opf rename, no nav synthesis, no metadata "
+        "injection. Paths stay as the API listed them; container.xml is "
+        "pointed at the original .opf. Output is written to "
+        "<book_id>-raw.epub so it does not overwrite a processed build. "
+        "Useful when you want an archival dump of the source package. "
+        "Combine with --calibre to let Calibre turn the raw package into a "
+        "reader-friendly EPUB."
+    ))
+    parser.add_argument('--calibre', action='store_true', help=(
+        "After the .epub is built, run Calibre's ebook-convert (EPUB→EPUB) "
+        "to normalise structure, media types, and TOC so the file works in "
+        "more readers. Requires ebook-convert on PATH. If Calibre is not "
+        "installed, this is treated as an error (exit non-zero) so you notice "
+        "missing tooling. As root, sets QTWEBENGINE_DISABLE_SANDBOX=1 "
+        "automatically. Especially useful with --raw."
+    ))
+    parser.add_argument('--log', metavar='PATH', default=None, help=(
+        "Write a detailed debug log to PATH (created if missing). Useful for "
+        "diagnosing auth, path rewriting, and download failures. Console "
+        "stays quiet unless --verbose is also set."
+    ))
+    parser.add_argument('--verbose', '-v', action='store_true', help=(
+        "Print progress and diagnostic messages to stderr (INFO level). "
+        "Combine with --log for a full DEBUG transcript on disk."
+    ))
+    parser.add_argument('--books', metavar='FILE', default=None, help=(
+        "Download every book listed in FILE (format: BOOK_ID or "
+        "BOOK_ID # \"title\"). When set, book_id positional may be omitted. "
+        f"Default list name in CONFIG: {CONFIG.get('books_file', 'books.txt')!r}."
+    ))
+    parser.add_argument('--output-dir', metavar='DIR', default='.', help=(
+        "Directory to write finished .epub files into (default: current directory)."
+    ))
+    parser.add_argument('--yes', '-y', action='store_true', help=(
+        "Assume yes for interactive safety prompts (untested Python, "
+        "unsupported OS, missing cookies). Useful for scripts/CI; use with care."
+    ))
+    parser.add_argument('--save-options', action='store_true', help=(
+        "After a successful run, save common options (cookies path, "
+        "concurrency, calibre, raw, cache-dir, etc.) to the options file "
+        f"({CONFIG.get('options_file', '.oreilly_options.json')}) so the next "
+        "run can omit them. Does not store --jwt secrets."
+    ))
+    parser.add_argument('--print-options', action='store_true', help=(
+        "Print the saved options file and exit."
+    ))
+    parser.add_argument('--version', action='version',
+                        version=f'%(prog)s {SCRIPT_VERSION}')
+    parser.add_argument('--skip-connectivity', action='store_true', help=(
+        "Skip the online-site and API v2 availability checks. Use only if "
+        "you know the network path is fine or are debugging offline."
+    ))
+    # book_id becomes optional when --books is used
+    # Apply saved options as argparse defaults (CLI still wins)
+    saved = load_saved_options()
+    if saved:
+        for key, val in saved.items():
+            if key not in _SAVED_OPTION_KEYS:
+                continue
+            # Map file keys to dest names (same for our flags)
+            try:
+                parser.set_defaults(**{key: val})
+            except TypeError:
+                pass
+        log.debug('loaded saved options: %s', saved)
+
     args = parser.parse_args()
+
+    if getattr(args, 'print_options', False):
+        opt_path = CONFIG.get('options_file') or '.oreilly_options.json'
+        print(f'options file: {opt_path}')
+        if os.path.isfile(opt_path):
+            print(open(opt_path, encoding='utf-8').read())
+        else:
+            print('(no saved options yet — run with --save-options to create)')
+        sys.exit(0)
+
+    # Soft environment checks (may prompt unless --yes)
+    check_python_version(assume_yes=args.yes)
+    check_operating_system(assume_yes=args.yes)
+
+    # Validate option values / formats early (clear errors, no download)
+    _validate_cli_args(args)
+
+    if getattr(args, 'skip_connectivity', False):
+        CONFIG['check_connectivity'] = False
+
+    # Apply CONFIG defaults when CLI left them at "unset" style
+    if not args.cookies and CONFIG.get('cookies_path'):
+        default_cookies = CONFIG['cookies_path']
+        if os.path.isfile(default_cookies):
+            args.cookies = default_cookies
+            log.info('using CONFIG cookies_path: %s', default_cookies)
+    if args.books is None and not getattr(args, 'book_id', None):
+        # allow bare run with only CONFIG books_file if it exists
+        bf = CONFIG.get('books_file')
+        if bf and os.path.isfile(bf):
+            args.books = bf
+
+    setup_logging(log_file=args.log, verbose=args.verbose)
+    log.info('Python %s', sys.version.replace('\n', ' '))
+    log.info('args: %s', _safe_args_for_log(args))
+
+    # CONFIG toggles (CLI flags already set win when user passed them;
+    # these fill in when user relies on CONFIG only).
+    if CONFIG.get('raw'):
+        args.raw = True
+    if CONFIG.get('calibre_polish'):
+        args.calibre = True
+    if CONFIG.get('make_nav') is False:
+        args.no_nav = True
 
     records = {}
     if args.cookies:
-        records.update(load_cookies(args.cookies))
+        if not os.path.isfile(args.cookies):
+            print(
+                f'warning: cookies file not found: {args.cookies!r}',
+                file=sys.stderr,
+            )
+        elif os.path.getsize(args.cookies) == 0:
+            print(
+                f'warning: cookies file is empty: {args.cookies!r}',
+                file=sys.stderr,
+            )
+        else:
+            records.update(load_cookies(args.cookies))
     if args.jwt:
         records['orm-jwt'] = _make_record('orm-jwt', args.jwt, secure=True)
+
+    # Consent if there is no usable session material
+    has_jwt = bool(records.get('orm-jwt', {}).get('value'))
+    has_any_cookie = bool(records)
+    if not has_jwt and not has_any_cookie:
+        print(
+            'warning: no valid cookies or orm-jwt found.\n'
+            '  Without authentication the API usually returns little or no '
+            'book content, and any EPUB produced may be empty or partial.',
+            file=sys.stderr,
+        )
+        if not args.webview:
+            if not ask_continue(
+                'Are you sure you want to continue without valid cookies '
+                'or orm-jwt? This may generate a partial EPUB.',
+                assume_yes=args.yes,
+            ):
+                _die(
+                    'Aborted. Export cookies from a logged-in browser '
+                    '(Cookie-Editor → cookies.json) or pass --jwt / --webview.'
+                )
+        else:
+            print(
+                '  --webview is set; a login window can supply cookies next.',
+                file=sys.stderr,
+            )
+    elif has_any_cookie and not has_jwt:
+        print(
+            'warning: cookies were loaded but orm-jwt is missing.\n'
+            '  The session may be incomplete; download can still fail or '
+            'be partial.',
+            file=sys.stderr,
+        )
+        if not ask_continue(
+            'Continue without orm-jwt?',
+            assume_yes=args.yes,
+        ):
+            _die(
+                'Aborted. Re-export cookies from an active logged-in tab '
+                'so orm-jwt is included, or pass --jwt.'
+            )
 
     webview_profile = args.webview_profile or (
         os.path.join(os.path.dirname(os.path.abspath(args.cookies)),
@@ -1701,101 +2823,234 @@ async def amain():
     if args.webview and not records:
         _run_webview_login()
 
-    filename = f'{args.book_id}.epub'
-    # Write to a temporary sibling first, then atomically rename. This avoids
-    # leaving a truncated/corrupt .epub if the process is interrupted while
-    # the ZipFile context manager is still open.
-    tmp_filename = f'{args.book_id}.epub.partial'
+    # ---- build job list (single book_id and/or --books file) ----
+    jobs = []  # list of (book_id, title)
+    if args.books:
+        if not os.path.isfile(args.books):
+            _die(f'error: books file not found: {args.books!r}')
+        jobs.extend(list(parse_books_file(args.books)))
+        log.info('loaded %d book(s) from %s', len(jobs), args.books)
+    if args.book_id:
+        if not str(args.book_id).isdigit():
+            _die(
+                f'error: book id must be digits only, got {args.book_id!r}\n'
+                f'  Example: 9781098148706\n'
+                + report_hint()
+            )
+        # Avoid duplicating if the same id is also in the books file
+        if not any(j[0] == args.book_id for j in jobs):
+            jobs.insert(0, (args.book_id, ''))
+    if not jobs and getattr(args, 'save_options', False):
+        # Allow saving defaults without downloading
+        save_options(args)
+        print('No books specified — options saved only.')
+        return
 
+    if not jobs:
+        _die(
+            'error: no books to download.\n'
+            '  Pass a book id:  python3 oreilly_downloader.py 9781098148706 '
+            '--cookies cookies.json\n'
+            '  Or a list file:  python3 oreilly_downloader.py --books books.txt '
+            '--cookies cookies.json\n'
+            f'  Or create {CONFIG.get("books_file", "books.txt")!r} '
+            f'(CONFIG books_file) with lines like:\n'
+            '    9781098148706 # "Math for Programmers"'
+        )
+
+    out_dir = args.output_dir or '.'
+    ensure_writable_dir(out_dir, 'output')
+    if args.cookies:
+        try:
+            ensure_writable_file_parent(args.cookies, 'cookies')
+        except SystemExit:
+            raise
+        if os.path.exists(args.cookies) and not os.access(args.cookies, os.R_OK):
+            _die(
+                f'error: cannot read cookies file {args.cookies!r}\n'
+                f'  Permission denied — check file ownership and storage access.'
+            )
+    if args.calibre and not shutil.which('ebook-convert'):
+        _die(
+            'error: --calibre was set but ebook-convert was not found on PATH.\n'
+            f'  Install Calibre from the official website: {CALIBRE_URL}\n'
+            '  Then ensure ebook-convert is on your PATH, or omit --calibre.\n'
+            '  Linux: install the "calibre" package, or use the official\n'
+            '  binary tarball. Windows: use the official installer and\n'
+            '  reopen the terminal so PATH updates apply.'
+        )
+
+    # Shared session headers (CONFIG may add extras)
+    session_headers = dict(DEFAULT_HEADERS)
+    session_headers.update(CONFIG.get('extra_headers') or {})
+
+    # Network + API version probe (skip only if CONFIG check_connectivity False)
+    await run_connectivity_checks(session_headers, assume_yes=args.yes)
+
+    any_failed = False
+    for job_index, (book_id, book_title) in enumerate(jobs, 1):
+        args.book_id = book_id
+        print(f'\n======== [{job_index}/{len(jobs)}] {book_id}'
+              + (f'  ({book_title})' if book_title else '')
+              + ' ========')
+        log.info('starting book %s title=%r', book_id, book_title)
+
+        suffix = CONFIG.get('output_suffix') or ''
+        if args.raw:
+            base_name = f'{book_id}-raw{suffix}.epub'
+        else:
+            base_name = f'{book_id}{suffix}.epub'
+        filename = os.path.join(out_dir, base_name)
+        tmp_filename = f'{filename}.partial'
+
+        ensure_writable_dir(os.path.join(args.cache_dir, str(book_id)), 'cache')
+        log.debug('preflight OK: output=%s cache=%s', filename, args.cache_dir)
+
+        try:
+            await _download_one_book(
+                args, records, session_headers, filename, tmp_filename,
+                webview_login=_run_webview_login,
+            )
+        except (KeyboardInterrupt, asyncio.CancelledError):
+            raise
+        except SystemExit:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            any_failed = True
+            write_error_log(exc, context=f'book_id={book_id}')
+            print(f'→ FAIL  {book_id} (continuing with next book)')
+            continue
+
+        # Rename to sanitised title when provided
+        if book_title:
+            safe = _sanitize_filename(book_title)
+            if args.raw:
+                final = os.path.join(out_dir, f'{safe}-raw{suffix}.epub')
+            else:
+                final = os.path.join(out_dir, f'{safe}{suffix}.epub')
+            if final != filename and os.path.isfile(filename):
+                if os.path.exists(final):
+                    print(f'  warning: {final} exists — keeping {filename}')
+                else:
+                    os.replace(filename, final)
+                    print(f'  renamed → {final}')
+                    filename = final
+
+        if args.calibre:
+            try:
+                polish_with_calibre(filename, required=True)
+            except SystemExit:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                any_failed = True
+                write_error_log(exc, context=f'calibre book_id={book_id}')
+
+    if any_failed:
+        sys.exit(1)
+
+    # Persist options when requested (or CONFIG auto_save_options)
+    if getattr(args, 'save_options', False) or CONFIG.get('auto_save_options'):
+        save_options(args)
+
+    return
+
+
+async def _download_one_book(args, records, session_headers, filename, tmp_filename,
+                             webview_login=None):
+    """Download a single book into filename (via tmp_filename)."""
     try:
         with zipfile.ZipFile(tmp_filename, 'w') as zfh:
+            timeout = aiohttp.ClientTimeout(
+                total=float(CONFIG.get('http_timeout_total', 120)),
+                connect=float(CONFIG.get('http_timeout_connect', 30)),
+                sock_read=float(CONFIG.get('http_timeout_sock_read', 90)),
+            )
             async with aiohttp.ClientSession(
                 raise_for_status=True,
-                headers=DEFAULT_HEADERS,
+                headers=session_headers,
+                timeout=timeout,
+                # SSL verification stays on (aiohttp default). Never disable
+                # certificate checks in this script.
             ) as session:
                 apply_cookies_to_session(session, records)
                 if not records:
                     print('No cookies/JWT provided. Continuing without…')
                 else:
-                    # Decoded locally, zero requests made - this can never
-                    # be confused with rate-limiting, an Akamai challenge,
-                    # or any other transient network condition, unlike
-                    # everything below it. Print it unconditionally, before
-                    # the network even gets a chance to muddy the picture.
                     rem = _jwt_remaining(records.get('orm-jwt', {}).get('value', ''))
                     jwt_definitely_expired = rem is not None and rem <= 0
                     if rem is not None:
-                        print(f'  orm-jwt\'s own expiry claim: '
-                              + (f'valid for ~{rem // 60}m more' if rem > 0
-                                 else f'expired {-rem}s ago'))
+                        print(
+                            "  orm-jwt's own expiry claim: "
+                            + (f'valid for ~{rem // 60}m more' if rem > 0
+                               else f'expired {-rem}s ago')
+                        )
 
                     ok, status, detail = await check_auth(session)
                     used_webview = False
-                    if not ok and args.webview:
-                        print(f'Authentication check failed: '
-                              f'HTTP {status if status is not None else "no response"} '
-                              f'- {detail}')
-                        if _run_webview_login():
-                            # The session's jar was already seeded from the
-                            # old records; re-apply now that records has
-                            # been updated in place with the fresh ones,
-                            # rather than opening a second session.
+                    if not ok and args.webview and webview_login:
+                        print(
+                            f'Authentication check failed: '
+                            f'HTTP {status if status is not None else "no response"} '
+                            f'- {detail}'
+                        )
+                        if webview_login():
                             apply_cookies_to_session(session, records)
-                            rem = _jwt_remaining(records.get('orm-jwt', {}).get('value', ''))
+                            rem = _jwt_remaining(
+                                records.get('orm-jwt', {}).get('value', '')
+                            )
                             jwt_definitely_expired = rem is not None and rem <= 0
                             ok, status, detail = await check_auth(session)
                             used_webview = True
 
                     if ok:
-                        print('Authentication successful.'
-                              + (' (via webview login)' if used_webview else ''))
+                        print(
+                            'Authentication successful.'
+                            + (' (via webview login)' if used_webview else '')
+                        )
                         rem = _jwt_remaining(
                             _best_jwt_from_jar(session)
                             or records.get('orm-jwt', {}).get('value', '')
                         )
                         if rem is not None:
                             if rem <= 0:
-                                print(f'  JWT expired {abs(rem)}s ago '
-                                      f'(server may still refresh via orm-rt)')
+                                print(
+                                    f'  JWT expired {abs(rem)}s ago '
+                                    f'(server may still refresh via orm-rt)'
+                                )
                             else:
                                 print(f'  JWT valid for ~{rem // 60}m')
                     else:
-                        print(f'Authentication check failed: '
-                              f'HTTP {status if status is not None else "no response"} '
-                              f'- {detail}')
+                        print(
+                            f'Authentication check failed: '
+                            f'HTTP {status if status is not None else "no response"} '
+                            f'- {detail}'
+                        )
                         if jwt_definitely_expired:
                             print(
                                 '  The expiry claim above confirms this token '
                                 'has genuinely expired - re-export cookies '
-                                'from an active, logged-in browser tab' + (
+                                'from an active, logged-in browser tab'
+                                + (
                                     ', or try --webview to log in directly.'
                                     if not args.webview else '.'
                                 )
                             )
                         elif status in (401, 403) and _uses_akamai_bot_manager(records):
                             print(
-                                '  This site is protected by Akamai Bot Manager '
-                                '(the bm_*/_abck cookies). A 401/403 here is not '
-                                'reliable evidence the login itself expired - '
-                                'Akamai can reject a request that merely looks '
-                                'automated even with a perfectly valid session, '
-                                'and let an identical request through moments '
-                                'later. Since the expiry claim above still '
-                                'shows time remaining (or was unreadable), the '
-                                'cookies may well still be good - try again '
-                                'shortly' + (
-                                    ', or pass --webview to log in directly '
-                                    'in a real browser window.'
-                                    if not args.webview else
-                                    ' (a --webview login attempt just failed '
-                                    'to produce a live session too).'
+                                '  This site is protected by Akamai Bot Manager. '
+                                'A 401/403 here is not reliable evidence the login '
+                                'itself expired. Try again shortly'
+                                + (
+                                    ', or pass --webview.'
+                                    if not args.webview else '.'
                                 )
                             )
                         elif args.cookies:
                             print(
                                 '  Re-export cookies from an active, '
-                                'logged-in browser tab and try again' + (
-                                    ', or pass --webview to log in directly.'
+                                'logged-in browser tab and try again'
+                                + (
+                                    ', or pass --webview.'
                                     if not args.webview else '.'
                                 )
                             )
@@ -1807,11 +3062,9 @@ async def amain():
                         cache_dir=args.cache_dir,
                         force=args.force,
                         make_nav=not args.no_nav,
+                        raw=args.raw,
                     )
                 finally:
-                    # Save even on failure/Ctrl-C part-way through: whatever
-                    # cookie state we ended up with is still worth keeping for
-                    # next time.
                     if args.cookies:
                         save_cookies(args.cookies, records, session)
                         print(f'saved current cookies to {args.cookies}')
@@ -1825,7 +3078,7 @@ async def amain():
                 os.unlink(tmp_filename)
         except OSError:
             pass
-        sys.exit(130)
+        raise
     except BaseException:
         try:
             if os.path.exists(tmp_filename):
@@ -1835,8 +3088,37 @@ async def amain():
         raise
 
 
-if __name__ == '__main__':
+def _sanitize_filename(title):
+    """Make a title safe for Windows / Linux / Android filenames."""
+    import re as _re
+    s = ''.join(ch for ch in title if ord(ch) >= 32 and ord(ch) != 127)
+    s = _re.sub(r'[/\\\\:*?"<>|]', '', s)
+    s = _re.sub(r'\s+', ' ', s).strip(' .')
+    if not s:
+        s = 'book'
+    upper = s.upper()
+    if upper in {'CON', 'PRN', 'AUX', 'NUL'} or _re.match(
+            r'^(COM|LPT)[0-9]$', upper):
+        s = s + '_book'
+    if len(s) > 180:
+        s = s[:180].rstrip(' .')
+    return s
+
+
+
+def main():
+    """Entry point with unknown-error catch-all → timestamped error log."""
     try:
         asyncio.run(amain())
     except KeyboardInterrupt:
+        print('\nInterrupted.', file=sys.stderr)
         sys.exit(130)
+    except SystemExit:
+        raise
+    except Exception as exc:  # noqa: BLE001 — last-resort unknown errors
+        write_error_log(exc, context='main')
+        sys.exit(1)
+
+
+if __name__ == '__main__':
+    main()

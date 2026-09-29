@@ -1,34 +1,503 @@
 **AI development disclosure:** This project was developed with assistance from the free versions of ChatGPT, Grok, and Claude (LLMs), with the user providing ideas and testing while the AIs and user collaboratively suggested, generated, reviewed, and refined code and solutions.
 
+---
 
 # O'Reilly EPUB downloader
 
-O'Reilly provides all of their books in EPUB format, but only through their own web reader.
+**Version:** 1.2.0
 
-This script downloads the individual files that make up a book you have access to and reassembles them into a normal, standalone `.epub` file, so you can read it in whatever app or device you prefer — including for accessibility reasons the built-in reader doesn't support well.
+O'Reilly Learning (formerly Safari Books Online) serves its library through a web reader. This project downloads the individual files that make up a book **you already have access to** and rebuilds them into a normal, standalone `.epub` you can open in any reader — desktop, mobile, e-ink, or accessibility tools the built-in reader may not support well.
 
-Before any usage, please read the [O'Reilly Terms of Service](https://learning.oreilly.com/terms/). This tool is meant for personal, offline access to books you already have a legitimate subscription to — not for redistribution.
+| | |
+| --- | --- |
+| **Main script** | `oreilly_downloader.py` |
+| **Batch helper** | `batch_download.sh` |
+| **Book lists** | `books.txt` / `sources.txt` |
+| **Report bugs** | [https://github.com/official-kandoamoa](https://github.com/official-kandoamoa) (open a GitHub Issue) |
+
+Before any use, please read the [O'Reilly Terms of Service](https://learning.oreilly.com/terms/). This tool is intended for **personal, offline access** to titles covered by your legitimate subscription — **not** for redistribution or sharing copyrighted files.
+
+```bash
+python3 oreilly_downloader.py              # quick reference card
+python3 oreilly_downloader.py --help       # full detailed help
+python3 oreilly_downloader.py --version
+```
+
+---
+
+## Table of contents
+
+1. [Features](#features)
+2. [Requirements](#requirements)
+3. [Installation](#installation)
+4. [Quick start](#quick-start)
+5. [Authentication](#authentication)
+6. [Command-line reference](#command-line-reference)
+7. [Output modes](#output-modes)
+8. [Batch download](#batch-download)
+9. [Saved options](#saved-options)
+10. [Configuration (`CONFIG`)](#configuration-config)
+11. [Cache and re-runs](#cache-and-re-runs)
+12. [Connectivity and API checks](#connectivity-and-api-checks)
+13. [Security defaults](#security-defaults)
+14. [Safety checks and prompts](#safety-checks-and-prompts)
+15. [Logging and error reports](#logging-and-error-reports)
+16. [Calibre polish](#calibre-polish)
+17. [How it works](#how-it-works)
+18. [Troubleshooting](#troubleshooting)
+19. [Limitations](#limitations)
+20. [Project files](#project-files)
+21. [Similar projects](#similar-projects)
+22. [Contributing](#contributing)
+
+---
 
 ## Features
 
-- Rebuilds a complete, valid EPUB: every chapter, stylesheet, and image the API lists, with all internal links and references rewritten so the result works as a normal self-contained book, not a pile of loose files.
-- Handles real-world chapter extensions (`.html`, `.xhtml`, **and** `.htm` — common in older Manning titles) so images and stylesheets are not left pointing at dead API URLs.
-- Authenticates with your actual browser cookies, not just a short-lived token, so a session lasts as long as your real login does instead of expiring within the hour.
-- Understands *why* a request failed instead of just reporting a bare error: it tells you whether your token has genuinely expired (checked locally, no network needed) or whether something else is blocking the request regardless of your login being fine.
-- Can open a real, native browser window to log in directly when nothing else works — see [Using `--webview`](#using---webview) below.
-- Retries transient failures (rate limiting, brief network blips) on its own; a handful of flaky files won't take down an entire large book.
-- **Caches** raw file bytes under `.oreilly_cache/<book_id>/` so a re-run only fetches what is still missing. The `.epub` is always rebuilt from the cache so path rewriting stays consistent. Pass `--force` to ignore the cache.
-- Shows download progress (`N/M files`, including how many came from cache).
-- When the package only has an EPUB2 NCX, synthesises an **EPUB3 `nav.xhtml`** and bumps the package to version 3.0 so modern readers get a working table of contents (NCX is kept for older readers). Disable with `--no-nav`.
-- Strips Calibre production metadata from the package document when present (common on Manning/O'Reilly packages that were run through Calibre upstream).
-- Normalises OPF media-types for content documents to `application/xhtml+xml`, rewrites NCX `src`/`href` paths, and resolves references against the EPUB root after renaming the package to `content.opf`.
+### Core download and EPUB build
 
-#### Calibre EPUB conversion
-**Important**: since the script only download HTML pages and may create a raw EPUB, many of the CSS and XML/HTML directives may be wrong for an E-Reader. To ensure best quality of the output, I suggest you to always convert the `EPUB` obtained by the script to standard-`EPUB` with [Calibre](https://calibre-ebook.com/).
-You can also use the command-line version of Calibre with `ebook-convert`, e.g.:
+- Lists every file the Learning API exposes for a book and downloads them concurrently (bounded by `--concurrency`).
+- Rewrites HTML / XHTML / **HTM**, CSS, OPF, and NCX so links no longer point at live `/api/v2/...` URLs.
+- Produces a standards-shaped EPUB container: `mimetype`, `META-INF/container.xml`, package under `EPUB/`.
+- Renames the package document to `content.opf` in normal mode; keeps the original name in `--raw` mode.
+- Synthesises an **EPUB3 `nav.xhtml`** from the NCX when the package only has an EPUB2 toc (disable with `--no-nav`).
+- Ensures `dcterms:modified` on the package document for EPUB 3 validity.
+- Strips residual Calibre production metadata when present in upstream packages.
+- Progress reporting (`N/M files`, including cache hits).
+- Atomic write via a `.partial` file, then rename — interrupted runs do not leave a half-written EPUB.
+
+### Authentication and session
+
+- Loads a full browser cookie export (domain, path, secure, httpOnly, expiry respected).
+- Writes cookies back after each run so sessions can outlive a single short-lived `orm-jwt`.
+- Optional `--jwt` for one-off use; optional `--webview` for interactive login (Akamai sensor cookies included).
+- Explains 401/403 failures in light of local JWT expiry claims vs Akamai Bot Manager.
+
+### Robustness
+
+- Retries rate limits and transient errors (403/429/5xx, network blips).
+- Empty HTTP 200 bodies are **not** cached (avoids poisoning the cache).
+- Processing failures delete that file’s cache entry so the next run can recover.
+- Preflight: site online check + **API v2** availability probe.
+- Host allowlist, HTTP timeouts, per-response size cap.
+- Path-traversal-safe cache keys.
+
+### Convenience
+
+- `--books` / `books.txt` multi-title lists with optional display titles.
+- `--save-options` / `.oreilly_options.json` to remember `--cookies`, `--calibre`, etc.
+- `--raw` archival dump; `--calibre` EPUB→EPUB polish via Calibre.
+- No-argument invocation prints a quick reference; `--help` prints a detailed guide.
+- Editable `CONFIG` dictionary at the top of the script for defaults.
+
+### Batch companion
+
+- `batch_download.sh` reads a list file, runs the downloader, renames to sanitised titles, optionally converts to PDF with Calibre while **keeping** the EPUB.
+
+---
+
+## Requirements
+
+| Component | Notes |
+| --- | --- |
+| **Python** | **3.9+ recommended.** 3.7–3.8 allowed with a warning and confirmation. Below 3.7 is rejected. Newer than 3.13.x warns (untested). |
+| **OS** | **Linux and Windows** are the supported targets. Other systems (e.g. macOS) show a warning and ask before continuing. |
+| **Packages** | `aiohttp`, `lxml`, `yarl` (declared for `uv`; install with pip if needed). |
+| **Optional: Calibre** | Provides `ebook-convert` for `--calibre` and batch PDF conversion. [https://calibre-ebook.com/](https://calibre-ebook.com/) |
+| **Optional: pywebview** | Only for `--webview` interactive login (needs a real display). |
+
+---
+
+## Installation
+
+### With `uv` (recommended)
+
+The script carries inline dependency metadata. `uv run` installs what it needs on first use:
+
 ```bash
-$ ebook-convert "9781491958698.epub" "9781491958698_CLEAR.epub"
+uv run oreilly_downloader.py 9781098148706 --cookies cookies.json
 ```
+
+### With pip + python3
+
+```bash
+pip install aiohttp lxml yarl
+# if your environment blocks system installs:
+# pip install aiohttp lxml yarl --break-system-packages
+
+python3 oreilly_downloader.py 9781098148706 --cookies cookies.json
+```
+
+### Optional tools
+
+```bash
+# Calibre: use your OS installer or https://calibre-ebook.com/
+# Confirm:
+ebook-convert --version
+
+# Webview login (GUI required):
+pip install pywebview
+# Linux may also need WebKitGTK, e.g.:
+# sudo apt install python3-gi gir1.2-webkit2-4.0
+```
+
+---
+
+## Quick start
+
+1. **Log in** at [https://learning.oreilly.com](https://learning.oreilly.com) in a normal browser.
+2. **Export cookies** for `learning.oreilly.com` to a file named `cookies.json`  
+   (extensions such as [Cookie-Editor](https://cookie-editor.com/) or EditThisCookie work). Export **all** cookies for the site, not only `orm-jwt`.
+3. **Find the book id** — the digit string in the book URL:
+
+   `https://learning.oreilly.com/library/view/some-book/9781098148706/`  
+   → id is `9781098148706`.
+
+4. **Download:**
+
+```bash
+python3 oreilly_downloader.py 9781098148706 --cookies cookies.json
+```
+
+You should see authentication status, a file listing, download progress, and finally:
+
+```text
+created 9781098148706.epub
+```
+
+5. **Optional — remember flags and polish with Calibre:**
+
+```bash
+python3 oreilly_downloader.py 9781098148706 --cookies cookies.json --calibre --save-options
+```
+
+Later:
+
+```bash
+python3 oreilly_downloader.py 9781098148706
+# picks up saved --cookies and --calibre from .oreilly_options.json
+```
+
+---
+
+## Authentication
+
+### Why full `--cookies` beats a bare JWT
+
+O'Reilly authenticates API calls primarily with the short-lived `orm-jwt` cookie (often under an hour). A full export also carries other cookies (for example refresh-related values and Akamai bot-manager cookies). The script:
+
+- Sends each cookie only according to its domain/path/secure/expiry metadata.
+- Skips cookies that are already expired at load time (with a warning).
+- Writes the **current** jar back to the same file after the run, including any values the server rotated mid-download.
+
+You can still pass `--jwt VALUE` alone or combined with `--cookies` (JWT overrides that one name).
+
+### Cookie file formats
+
+Accepted:
+
+- Browser extension export: JSON **array** of objects with `name`, `value`, `domain`, `path`, etc.
+- Simple object: `{ "orm-jwt": "...", "orm-rt": "..." }`
+
+The file written back is the full list shape (extension-friendly).
+
+### `--webview`
+
+Use when exports keep failing or Akamai blocks scripted requests:
+
+```bash
+python3 oreilly_downloader.py 9781098148706 --cookies cookies.json --webview
+```
+
+Opens a native browser window, lets you log in normally, then captures cookies (including sensor cookies) and saves them to `--cookies` when provided. Requires a graphical session (not plain SSH without display forwarding).
+
+### Missing or empty credentials
+
+If there is no usable cookie jar / `orm-jwt`, the script **does not** start downloading until you confirm:
+
+```text
+Are you sure you want to continue without valid cookies or orm-jwt?
+This may generate a partial EPUB. [y/N]
+```
+
+Use `--webview` to supply a session, or `--yes` to skip prompts in automation (not recommended unless you know the risk).
+
+---
+
+## Command-line reference
+
+```text
+python3 oreilly_downloader.py [BOOK_ID] [options]
+python3 oreilly_downloader.py --books FILE [options]
+```
+
+| Argument | Description |
+| --- | --- |
+| `book_id` | Numeric id from the Learning URL. Optional when `--books` is set or a `CONFIG` books file exists. Must be digits only. |
+| `--cookies PATH` | Path to cookie JSON. Preferred auth method. |
+| `--jwt VALUE` | `orm-jwt` string only; short-lived. **Never** written to the saved-options file. |
+| `--books FILE` | Download every valid line in FILE (see [Batch download](#batch-download)). |
+| `--output-dir DIR` | Directory for finished EPUBs (default: current directory). |
+| `--concurrency N` | Parallel file downloads (default: 8, maximum accepted: 64). |
+| `--cache-dir PATH` | Cache root directory (default: `.oreilly_cache`). |
+| `--force` | Ignore on-disk cache; re-fetch every file. |
+| `--raw` | No content rewriting; output `<id>-raw.epub`. |
+| `--calibre` | After a successful build, run Calibre `ebook-convert` (EPUB→EPUB). Exits early if `ebook-convert` is missing. |
+| `--no-nav` | Do not synthesise EPUB3 `nav.xhtml` (ignored in `--raw` mode). |
+| `--webview` | Interactive browser login when needed. |
+| `--webview-profile PATH` | Directory for the embedded browser profile. |
+| `--log PATH` | Write a DEBUG log to PATH (secrets redacted). |
+| `-v`, `--verbose` | Print INFO-level messages to stderr. |
+| `--save-options` | After success (or alone with flags), save common options to the options file. |
+| `--print-options` | Print the saved options file and exit. |
+| `--skip-connectivity` | Skip site / API v2 probes. |
+| `-y`, `--yes` | Auto-confirm safety prompts (old/new Python, OS, missing cookies, weak API probe). |
+| `--version` | Print version and exit. |
+| `-h`, `--help` | Full help text including the detailed guide. |
+
+Invalid options or bad value formats exit with code `2`, a short explanation, and a pointer to quick reference / full help / GitHub Issues.
+
+---
+
+## Output modes
+
+### Default (processed) EPUB
+
+- HTML/CSS/OPF/NCX rewritten for offline relative paths.
+- Package document exposed as `EPUB/content.opf`.
+- Optional nav synthesis and `dcterms:modified`.
+- Output name: `<book_id>.epub` (or title-based name when using a list with titles).
+
+### `--raw`
+
+- File bytes stored exactly as returned by the API.
+- Original paths preserved; `container.xml` points at the real `.opf`.
+- Output: `<book_id>-raw.epub`.
+- Absolute `/api/v2/...` links remain inside chapters unless you also run `--calibre` or convert manually.
+
+### `--calibre`
+
+Runs:
+
+```bash
+ebook-convert input.epub input.calibre.epub
+# then replaces input.epub with the polished file
+```
+
+As root, sets `QTWEBENGINE_DISABLE_SANDBOX=1`. If Calibre is not installed, the script **exits before downloading** when `--calibre` was requested, and points you to [https://calibre-ebook.com/](https://calibre-ebook.com/).
+
+---
+
+## Batch download
+
+### Using the Python script
+
+`books.txt` (default name also in `CONFIG['books_file']`):
+
+```text
+# comments and blank lines ignored
+9781098148706 # "Math for Programmers"
+9781098148706 # 'Grokking Deep Learning'
+9781098104030
+```
+
+Rules:
+
+| Rule | Detail |
+| --- | --- |
+| Separator | A single `#` between id and optional title |
+| Book id | Digits only |
+| Multiple `#` | Line rejected (`test # test # test`) |
+| Non-numeric id | Line rejected (`test # test`) |
+| Titles | Optional quotes; sanitised for Windows / Linux / Android file names |
+
+```bash
+python3 oreilly_downloader.py --books books.txt --cookies cookies.json
+python3 oreilly_downloader.py --books books.txt --cookies cookies.json --calibre
+```
+
+### Using `batch_download.sh`
+
+```bash
+chmod +x batch_download.sh
+./batch_download.sh -f books.txt --cookies cookies.json
+./batch_download.sh -f books.txt --cookies cookies.json --raw --calibre
+./batch_download.sh -f books.txt --cookies cookies.json --no-pdf
+```
+
+Behaviour:
+
+- Passes unknown flags through to `oreilly_downloader.py`.
+- Renames `<id>.epub` → `<Sanitised Title>.epub` when a title was given.
+- Optionally runs `ebook-convert` to PDF after each success; **keeps the EPUB**.
+- Prefers `uv run` when `uv` is on `PATH`, else `python3` / `python`.
+- Exit code `1` if any book failed; others still attempted.
+
+Title sanitisation removes `\ / : * ? " < > |` and control characters, trims leading/trailing spaces and dots, adjusts Windows reserved names (`CON`, `PRN`, …), and caps length.
+
+---
+
+## Saved options
+
+Avoid retyping common flags:
+
+```bash
+python3 oreilly_downloader.py --cookies cookies.json --calibre --concurrency 4 --save-options
+```
+
+Creates or updates `.oreilly_options.json` (path overridable via `CONFIG['options_file']`), for example:
+
+```json
+{
+  "calibre": true,
+  "concurrency": 4,
+  "cookies": "cookies.json",
+  "cache_dir": ".oreilly_cache",
+  "output_dir": "."
+}
+```
+
+```bash
+python3 oreilly_downloader.py --print-options
+python3 oreilly_downloader.py 9781098148706   # uses saved defaults
+```
+
+- **CLI always wins** over the file.
+- **`--jwt` is never saved.**
+- Set `CONFIG['auto_save_options'] = True` to refresh the file after every successful run.
+- You can save without downloading:  
+  `python3 oreilly_downloader.py --cookies cookies.json --save-options`
+
+---
+
+## Configuration (`CONFIG`)
+
+Near the top of `oreilly_downloader.py` is an editable dictionary. Change defaults without touching the rest of the code. **CLI flags override CONFIG.**
+
+| Key | Role |
+| --- | --- |
+| `cookies_path` | Used when `--cookies` is omitted and the file exists |
+| `cache_dir` | Download cache root |
+| `concurrency` | Default parallel downloads |
+| `books_file` | Default list file name |
+| `error_log_dir` | Directory for crash logs |
+| `make_nav` | Synthesise EPUB3 nav when possible |
+| `calibre_polish` | Act as if `--calibre` were always passed |
+| `raw` | Act as if `--raw` were always passed |
+| `output_suffix` | Optional extra suffix before `.epub` |
+| `extra_headers` | Extra HTTP headers (advanced) |
+| `options_file` | Path for `--save-options` |
+| `auto_save_options` | Save options after every success |
+| `api_version` | Expected API major version (default `2`) |
+| `check_connectivity` | Run site/API probes |
+| `http_timeout_total` / `_connect` / `_sock_read` | aiohttp timeouts (seconds) |
+| `max_response_bytes` | Per-file size cap (default 80 MiB; `0` = unlimited) |
+| `allowed_hosts` | URL host allowlist suffixes |
+| `cookies_file_mode` | Unix mode for saved cookies (default `0o600`) |
+
+---
+
+## Cache and re-runs
+
+Raw API payloads are stored under:
+
+```text
+.oreilly_cache/<book_id>/...
+```
+
+- Non-empty cache files are reused unless `--force` is set.
+- Empty 200 responses are never written.
+- Failed processing removes that entry so a later run can refetch.
+- The EPUB is always rebuilt from cached (or fresh) bytes so rewriting stays consistent.
+- Delete `.oreilly_cache/` or a single book subdirectory to reclaim disk space.
+
+---
+
+## Connectivity and API checks
+
+Before downloading, unless `--skip-connectivity` or `CONFIG['check_connectivity'] = False`:
+
+1. **Site probe** — `GET https://learning.oreilly.com/`  
+   - Connection errors → treat as offline and exit with guidance (network, DNS, VPN, firewall).
+
+2. **API v2 probe** — `GET /api/v2/` and `/api/v2/epubs/`  
+   - **401 / 403 / 200** → API route still exists (auth may be required).  
+   - **404** → path may have changed; warn and ask whether to continue.  
+   - Timeouts / connection errors → unavailable.
+
+This script is built for **API version 2** (`/api/v2/epubs/urn:orm:book:…/files/`). If O'Reilly retires or renames the API, downloads will fail; adjust `CONFIG['api_version']` only if the project is updated to match, and [open an Issue](https://github.com/official-kandoamoa) if the site works in a browser but probes keep failing.
+
+---
+
+## Security defaults
+
+| Control | Behaviour |
+| --- | --- |
+| TLS | Certificate verification remains enabled |
+| Hosts | Only hosts under `allowed_hosts` (default `*.oreilly.com`) |
+| Timeouts | Connect / read / total limits from CONFIG |
+| Size | Default max 80 MiB per response |
+| Cookies file | `chmod` to owner-only (`0600`) on Unix when saving |
+| Logs | JWTs and long tokens redacted in `--log` and `error_logs/*` |
+| CLI log | `--jwt` value not written to debug logs as plaintext |
+| Subprocess | Calibre invoked as an argument list (no shell) |
+
+---
+
+## Safety checks and prompts
+
+| Situation | Behaviour |
+| --- | --- |
+| Python &lt; 3.7 | Exit |
+| Python 3.7–3.8 | Warning + confirm (recommended 3.9+) |
+| Python newer than tested (3.13.x) | Warning + confirm |
+| OS not Linux/Windows | Warning + confirm |
+| Missing `aiohttp` / `lxml` / `yarl` | Exit with install commands |
+| Unwritable output, cache, or cookies path | Exit with permission hint (storage permission, read-only FS, …) |
+| `--calibre` but no `ebook-convert` | Exit before download + link to Calibre’s site |
+| No cookies / no orm-jwt | Confirm before download |
+| API probe failed | Explain + confirm |
+
+Use `-y` / `--yes` to auto-accept prompts in CI or wrappers (use carefully).
+
+---
+
+## Logging and error reports
+
+```bash
+python3 oreilly_downloader.py 978… --cookies cookies.json --log debug.log --verbose
+```
+
+- `--log` — DEBUG detail to a file (redacted).  
+- `--verbose` — INFO on stderr.  
+
+Unexpected exceptions create:
+
+```text
+error_logs/error_log_YYYY_MM_DD_HHMMSS.log
+```
+
+Contents include timestamp, Python version, script version, redacted argv, and traceback. The console message asks you to **open a GitHub Issue** at:
+
+**https://github.com/official-kandoamoa**
+
+---
+
+### Calibre EPUB conversion
+**Important**: To ensure best quality of the output, I suggest you to always convert the `EPUB` obtained by the script to standard-`EPUB` with [Calibre](https://calibre-ebook.com/).
+
+Even a carefully rewritten EPUB can benefit from Calibre’s normaliser (structure, media types, TOC quirks).
+
+```bash
+python3 oreilly_downloader.py 9781491958698 --cookies cookies.json --calibre
+```
+
+You can also use the command-line version of Calibre with `ebook-convert`, e.g.:
+
+```bash
+ebook-convert "9781491958698.epub" "9781491958698_CLEAR.epub"
+```
+
 After the execution, you can read the `9781491958698_CLEAR.epub` in every E-Reader and delete all other files.
 
 The program offers also an option to ensure best compatibilities for who wants to export the `EPUB` to E-Readers like Amazon Kindle: `--kindle`, it blocks overflow on `table` and `pre` elements (see [example](#use-or-not-the---kindle-option)).  
@@ -36,206 +505,90 @@ In this case, I suggest you to convert the `EPUB` to `AZW3` with Calibre or to `
   
 ![Calibre IgnoreMargins](https://github.com/lorenzodifuccia/cloudflare/raw/master/Images/safaribooks/safaribooks_calibre_IgnoreMargins.png "Select Ignore margins")  
 
-thanks for your suggestions in your readme, lorenzodifuccia. https://github.com/lorenzodifuccia/safaribooks
+Install from the official site: [https://calibre-ebook.com/](https://calibre-ebook.com/).  
+Credit for documenting the polish workflow in similar tools: [lorenzodifuccia/safaribooks](https://github.com/lorenzodifuccia/safaribooks).
 
-## Requirements
+---
 
-- Python 3.9+
-- [`uv`](https://docs.astral.sh/uv/) (recommended), or `pip`
-- Optionally, the `pywebview` package if you want to use `--webview` (see below) — not needed for normal use
+## How it works
 
-## Installation
+1. **Bootstrap** — Python version floor, dependency imports, optional soft prompts after CLI parse.  
+2. **Resolve jobs** — Single `book_id` and/or `--books` / CONFIG list; validate id format.  
+3. **Connectivity** — Site + API v2 probes.  
+4. **Authenticate** — Load cookies/JWT; optional webview; consent if unauthenticated.  
+5. **List files** — Paginate `GET /api/v2/epubs/urn:orm:book:<id>/files/`.  
+6. **Download** — Concurrent GETs with retries, allowlist, size cap, disk cache.  
+7. **Transform** (unless `--raw`) — `to_xhtml`, CSS/OPF/NCX rewrite, nav, metadata cleanup.  
+8. **Package** — Zip EPUB layout; atomic replace into the final path.  
+9. **Optional** — Title rename, Calibre polish, save options, error isolation per book in multi mode.
 
-The script declares its own dependencies inline, so with [`uv`](https://docs.astral.sh/uv/) installed you don't need a separate install step at all — `uv run` fetches them automatically the first time:
+---
 
-```
-$ uv run oreilly_downloader.py 9781098148706 --cookies cookies.json
-```
+## Troubleshooting
 
-Without `uv`, install the dependencies yourself and run it with `python3`:
-
-```
-$ pip install aiohttp lxml yarl
-$ python3 oreilly_downloader.py 9781098148706 --cookies cookies.json
-```
-
-Every example below uses `python3 oreilly_downloader.py ...`; substitute `uv run oreilly_downloader.py ...` if that's how you installed it.
-
-## Quick start
-
-1. Log into [learning.oreilly.com](https://learning.oreilly.com) in your browser.
-2. Install a cookie-export extension — e.g. [Cookie-Editor](https://cookie-editor.com/) (Chrome, Firefox, Edge) or EditThisCookie — and export **all cookies for the site** to a file called `cookies.json`. You don't need to hand-pick which cookies to include; anything not scoped to `oreilly.com` is ignored automatically.
-3. Find the book's ID: it's the string of digits in the book's learning.oreilly.com URL. For `https://learning.oreilly.com/library/view/some-book/9781098148706/`, the id is `9781098148706`.
-4. Run:
-
-   ```
-   $ python3 oreilly_downloader.py 9781098148706 --cookies cookies.json
-   Authentication successful.
-     JWT valid for ~47m
-   listing https://learning.oreilly.com/api/v2/epubs/urn:orm:book:9781098148706/files/
-   downloading 342 files (concurrency=8, cache=.oreilly_cache/9781098148706)
-     25/342 files
-     50/342 files
-     ...
-     342/342 files
-     added EPUB3 nav.xhtml (from toc.ncx)
-   saved current cookies to cookies.json
-   created 9781098148706.epub
-   ```
-
-That's it — `9781098148706.epub` is a complete, standalone book.
-
-Re-run the exact same command whenever you want another book (just change the id), or to rebuild the same book after a partial failure. Cached files are reused automatically:
-
-```
-   downloading 342 files (concurrency=8, cache=.oreilly_cache/9781098148706)
-     342/342 files (342 from cache)
-   reused 342/342 files from cache
-   created 9781098148706.epub
-```
-
-`--cookies` keeps itself up to date on every run (see below), so in practice you'll only need to re-export from the browser once in a while, not before every download.
-
-## Command-line reference
-
-```
-python3 oreilly_downloader.py BOOK_ID [options]
-```
-
-| Argument | Description |
+| Symptom | What to try |
 | --- | --- |
-| `book_id` | *(required)* The numeric book id from the book's learning.oreilly.com URL. |
-| `--cookies PATH` | Path to a JSON file of learning.oreilly.com's cookies. The recommended way to authenticate — see [Authentication](#authentication) below. |
-| `--jwt VALUE` | Just the `orm-jwt` cookie's value, as a quick one-off alternative to `--cookies`. Expires within about an hour and can't be refreshed — fine for a single small book, not for anything that might outlive it. |
-| `--concurrency N` | How many files to download in parallel. Default: `8`. Lower this if you see a lot of `403` failures on a large book — it usually means the API's rate limiting is kicking in. |
-| `--cache-dir PATH` | Directory for caching raw API file bytes so a re-run only fetches what is still missing. Default: `.oreilly_cache/<book_id>/`. |
-| `--force` | Ignore the on-disk cache and re-download every file. The `.epub` is always rebuilt either way; this only forces fresh network fetches. |
-| `--no-nav` | Do not synthesise an EPUB3 `nav.xhtml` from the NCX. By default a nav document is generated when the package only has an EPUB2 NCX, so modern readers get a working table of contents. |
-| `--webview` | If there's no session yet, or the one you gave fails outright, open a real browser window so you can log in directly. See [Using `--webview`](#using---webview). |
-| `--webview-profile PATH` | Where `--webview` keeps its own persistent browser profile between runs. Defaults to a folder next to `--cookies`. |
-| `-h`, `--help` | Show the built-in help (kept in sync with this document, and the source of truth if the two ever disagree). |
+| `missing required Python package(s)` | `pip install aiohttp lxml yarl` or use `uv run` |
+| `cannot reach learning.oreilly.com` | Check network/VPN/DNS; try a browser; disable `--skip-connectivity` only for debugging |
+| `API v2` unavailable / 404 | Site may have changed API; open an Issue with details |
+| Auth failed, JWT claim still valid | Likely Akamai; retry later or `--webview` |
+| Auth failed, JWT expired | Re-export cookies from a logged-in tab |
+| Partial EPUB / missing images | Re-run same command (cache fills gaps); try `--force` if content is stale |
+| `--calibre` errors at start | Install Calibre and ensure `ebook-convert` is on `PATH` |
+| Permission denied writing files | Fix directory permissions; on Android/Termux grant storage access |
+| Invalid sources line | Digits-only id; single `#`; see books.txt rules |
+| Need support | Attach a redacted `--log` file and open an Issue at the GitHub link above |
 
-## Authentication
-
-### Why `--cookies` instead of just a JWT
-
-O'Reilly authenticates API requests with a short-lived token (the `orm-jwt` cookie), which on its own typically expires within an hour. `--jwt` gives you just that value, quickly, but once it expires there's no way to renew it — you have to go back to the browser for a new one.
-
-`--cookies` instead loads your *entire* cookie set for the site. That matters for two reasons:
-
-- Other cookies (notably `orm-rt`, a refresh token) may be what lets O'Reilly's own backend transparently hand back a fresh token on an ordinary request once the old one has expired — the same mechanism that keeps a real browser tab logged in without you noticing. Whether this actually happens depends on O'Reilly's server, not on this script; when it works, requests just keep succeeding with the token quietly renewed underneath.
-- After the run, the script writes your **current** cookies — including anything the API rotated in along the way — back to the same file. Point `--cookies` at the same path every time, and each run continues from wherever the last one left off.
-
-Every field in your exported cookies (`domain`, `path`, `secure`, `httpOnly`, `sameSite`, `expirationDate`, and so on) is read and genuinely used, not just the value — so a cookie is only ever sent where and while it's actually supposed to be valid, the same way a real browser handles it. A cookie that's already past its own expiry date is skipped at load time with a warning rather than sent anyway. The file the script writes back is in that same full shape, so it stays compatible with re-importing straight back into a browser extension if you ever want to.
-
-You can combine `--cookies` with `--jwt` to override just the token while keeping the rest of the cookies from the file.
-
-### Understanding a failed login
-
-**"No cookies/JWT provided."** Neither `--cookies` nor `--jwt` was given. The download proceeds anyway, but will typically only get content O'Reilly serves to logged-out visitors — usually nothing, for a real book.
-
-**"Authentication check failed: HTTP 401/403 - ..."** This does *not* necessarily mean your login expired. Learning.oreilly.com sits behind **Akamai Bot Manager** (recognizable by cookies named `bm_s`, `bm_sz`, `bm_so`, `bm_lso`, and `_abck`), which can reject a request that merely *looks* automated — an unexpected header, an unconvincing browser fingerprint — independently of whether your actual session is completely valid. It can also let an identical request through moments later.
-
-To help tell these apart, the script decodes your `orm-jwt`'s own expiry claim locally — no network request needed — and prints it before attempting anything:
-
-```
-  orm-jwt's own expiry claim: valid for ~52m more
-```
-
-or
-
-```
-  orm-jwt's own expiry claim: expired 3600s ago
-```
-
-If a failure shows up *and* that claim already says "expired," the message tells you plainly to re-export cookies from your browser. If the claim still shows time remaining, the message instead explains that this looks like Akamai rejecting the request itself, and suggests just trying again shortly — or using `--webview` (below) to get past it directly.
-
-A handful of `FAILED to download ...` lines at the very end, naming specific files, usually just means transient rate-limiting on a big book. Re-run the exact same command; files already in the cache are reused automatically (pass `--force` if you want everything fetched again from the network).
-
-## Using `--webview`
-
-Some situations can't be solved by better cookies alone:
-
-- Akamai's own bot-detection cookies (`_abck`, `bm_sz`, ...) are populated by an obfuscated JavaScript sensor that only runs inside a real browser page — never in a script's HTTP requests, no matter how convincing the headers.
-- `orm-jwt`/`orm-rt` are only ever issued after actually completing O'Reilly's login flow.
-
-`--webview` opens a real, native browser window — using your OS's actual browser engine (WebKit on Linux/macOS, WebView2 on Windows), not a simulation — so you can log in exactly as normal, and Akamai's sensor gets to do whatever it needs to. Whatever cookies that produces, Akamai's included, are picked up automatically.
-
-### Setup
-
-`pywebview` is an optional dependency, installed separately (it isn't downloaded automatically, since most usage doesn't need it):
-
-```
-$ pip install pywebview --break-system-packages
-```
-
-It also needs a native GUI toolkit already present on your system:
-
-- **Linux**: GTK + WebKit2 (e.g. `sudo apt install python3-gi gir1.2-webkit2-4.0` on Debian/Ubuntu — check [pywebview's docs](https://pywebview.flowrl.com/) if package names differ for your distro)
-- **macOS**: nothing extra — it uses the built-in WebKit
-- **Windows**: nothing extra — it uses the built-in WebView2 (bundled with Windows 10/11)
-
-**`--webview` needs an actual display** (X11, Wayland, or a macOS/Windows desktop session). It will not work over a plain SSH terminal or inside a headless container.
-
-### Usage
-
-```
-$ python3 oreilly_downloader.py 9781098148706 --cookies cookies.json --webview
-```
-
-`--webview` kicks in automatically in two situations:
-
-- **No cookies at all yet** (e.g. `cookies.json` doesn't exist) — it opens the login window immediately, before attempting anything else.
-- **The cookies you gave fail the authentication check** — it retries a few times first (in case it's just a transient block), and only opens the window if that still doesn't succeed.
-
-A window titled *"Log in to O'Reilly — this window closes itself once you're in"* will appear. Log in there as you normally would. The script polls in the background, and as soon as it detects a live session, **the window closes itself automatically** — you don't need to close it manually. If nothing happens within 10 minutes, it gives up and the window closes on its own.
-
-Once it succeeds, you'll see:
-
-```
-Authentication successful. (via webview login)
-```
-
-and the resulting cookies are saved back to `--cookies` right away, so a future run won't need the window again unless the whole session dies.
-
-`--webview-profile PATH` controls where the embedded browser keeps its own persistent profile (separate from `--cookies`) between runs — by default, a `.oreilly_webview_profile` folder next to your cookies file. This means logging in via `--webview` is normally a one-time thing, not something that happens on every run.
-
-## Cache and re-runs
-
-Raw API payloads are stored under `.oreilly_cache/<book_id>/` (override with `--cache-dir`). On a later run with the same book id:
-
-- Files already present and non-empty in the cache are **not** re-fetched.
-- Everything is still processed and packed into a fresh `.epub` (path rewriting, nav synthesis, Calibre cleanup, etc.).
-- Use `--force` to ignore the cache and download every file again.
-
-This makes recovering from a partial failure (a few rate-limited images, an expired JWT mid-run) much faster: fix auth if needed, re-run the same command, and only the missing pieces hit the network.
-
-## How it works, briefly
-
-1. Lists every file in the book via O'Reilly's own API (paginating through all results before downloading anything).
-2. Downloads each file concurrently (bounded by `--concurrency`), writing raw bytes into the on-disk cache and retrying rate-limited or transiently-failed requests with backoff. Cached files are skipped unless `--force` is set.
-3. Converts each HTML/XHTML/HTM chapter to valid, self-contained XHTML: rewrites every internal link, image, and stylesheet reference from the API's absolute paths to correct relative ones, fixes up SVG-wrapped cover images, and patches over a few known HTML/XML interoperability quirks (embedded `<style>` content, XML namespace declarations) so the result renders correctly both in strict EPUB readers and in the more lenient parsers most real reading apps actually use.
-4. Rewrites CSS `url()` / `@import` references and NCX `src`/`href` attributes the same way; normalises OPF item `media-type` for content documents to `application/xhtml+xml`.
-5. If the package has an NCX but no EPUB3 nav document, synthesises `nav.xhtml` from the NCX, registers it in the package with `properties="nav"`, and sets the package version to 3.0 (NCX is retained for EPUB2 readers).
-6. Strips Calibre production metadata from the package document when present.
-7. Packages everything into a proper EPUB container (`mimetype`, `META-INF/container.xml`, and `EPUB/content.opf`) and writes it out atomically, so an interrupted run never leaves a corrupt half-written file behind.
+---
 
 ## Limitations
 
-- This can't defeat Akamai's bot detection outright — `--webview` works around it by using a real browser, not by tricking the anti-bot system.
-- A cookie export only lasts as long as the underlying login session does. Once that's genuinely dead (not just the short-lived token), you need to log in again — either back in your regular browser, or via `--webview`.
-- Only works for books your account actually has access to; it downloads exactly what the API would already show you in the web reader; nothing more.
-- The on-disk cache is not size-capped; delete `.oreilly_cache/` (or a single book subdirectory) if you want to reclaim space.
+- Does not bypass Akamai or other bot management; `--webview` uses a real browser instead of spoofing it.
+- Only content your account is allowed to retrieve is available.
+- Cookie lifetime follows the real login session; when the session is fully dead, export again or use `--webview`.
+- Cache growth is unbounded until you delete `.oreilly_cache/`.
+- `--raw` packages are archival; they may not open cleanly in all readers without Calibre or the default rewrite mode.
+- This is not an official O'Reilly product.
 
-## Contributing
+---
 
-I am really interested in adding any major features to this project if necessary. I will genuine accept fixes, even that adds a significant amount of new code.
+## Project files
 
-If you feel like something is missing, feel free to contribute or fork. You may also look at rejected pull requests, maybe someone already worked on something similar.
+| File | Purpose |
+| --- | --- |
+| `oreilly_downloader.py` | Main downloader (CLI, CONFIG, cache, rewrite, safety) |
+| `batch_download.sh` | Shell batch runner + title rename + optional PDF |
+| `books.txt` / `sources.txt` | Example book lists (`id # "title"`) |
+| `cookies.json` | Your export (not shipped; create locally) |
+| `.oreilly_options.json` | Created by `--save-options` |
+| `.oreilly_cache/` | Per-book raw API cache |
+| `error_logs/` | Timestamped crash reports |
+
+---
 
 ## Similar projects
 
-- [https://github.com/lorenzodifuccia/safaribooks](https://github.com/lorenzodifuccia/safaribooks) (python)
-- [https://github.com/hurlenko/orly](https://github.com/hurlenko/orly) (rust)
-- [https://github.com/jenni/obooks](https://github.com/jenni/obooks) (javascript)
-- [https://github.com/rahulvramesh/oreilly-books-grabber](https://github.com/rahulvramesh/oreilly-books-grabber) (go)
+- [lorenzodifuccia/safaribooks](https://github.com/lorenzodifuccia/safaribooks) (Python)
+- [hurlenko/orly](https://github.com/hurlenko/orly) (Rust)
+- [jenni/obooks](https://github.com/jenni/obooks) (JavaScript)
+- [rahulvramesh/oreilly-books-grabber](https://github.com/rahulvramesh/oreilly-books-grabber) (Go)
+
+---
+
+## Contributing
+
+Fixes and carefully scoped features are welcome. Please open an Issue first for larger changes:
+
+**https://github.com/official-kandoamoa**
+
+When reporting a bug, include:
+
+- Script version (`--version`)
+- OS and Python version
+- Whether you used `--cookies`, `--webview`, `--raw`, `--calibre`
+- A **redacted** log from `--log` (secrets are stripped, but review before uploading)
+- The exact command line (omit JWT values)
+
+---
+
+*This software is provided as-is, for interoperability with content you are already licensed to access. Respect publishers’ rights and O'Reilly’s terms.*
