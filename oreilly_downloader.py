@@ -1324,6 +1324,122 @@ def _pre_rewrite_style_urls(html_text, root_path, current_dir):
     return ''.join(result)
 
 
+
+def strip_akamai_injected(tree):
+    """Remove anti-bot markup Akamai sometimes injects into HTML responses.
+
+    From the community download_v2 approach: drop <script>, absolute-path
+    <link href="/..."> (site chrome, not book CSS), and #sec-overlay.
+    Mutates the lxml tree in place.
+    """
+    to_remove = []
+    for el in tree.iter():
+        tag = _local_tag(el)
+        if tag == 'script':
+            to_remove.append(el)
+            continue
+        if tag == 'link':
+            href = el.get('href') or ''
+            # Absolute site paths only — keep relative book stylesheets
+            if href.startswith('/') and not href.startswith('//'):
+                # Keep if it looks like an API book asset path
+                if '/api/v2/epubs/' not in href and '/files/' not in href:
+                    to_remove.append(el)
+            continue
+        if tag == 'div' and (el.get('id') or '') == 'sec-overlay':
+            to_remove.append(el)
+    for el in to_remove:
+        parent = el.getparent()
+        if parent is not None:
+            parent.remove(el)
+
+
+def strip_akamai_from_text(text):
+    """Regex fallback for full HTML documents (e.g. nav) before parse."""
+    if isinstance(text, bytes):
+        try:
+            text = text.decode('utf-8')
+        except UnicodeDecodeError:
+            text = text.decode('utf-8', errors='replace')
+    text = re.sub(
+        r'<script\b[^>]*>.*?</script>',
+        '',
+        text,
+        flags=re.I | re.S,
+    )
+    text = re.sub(
+        r'<link\b[^>]*href="/[^"]*"[^>]*/?>',
+        '',
+        text,
+        flags=re.I | re.S,
+    )
+    text = re.sub(
+        r'<div\b[^>]*\bid=["\']sec-overlay["\'][^>]*>.*?</div>',
+        '',
+        text,
+        flags=re.I | re.S,
+    )
+    return text
+
+
+async def fetch_book_info(session, book_id):
+    """GET /api/v2/epubs/urn:orm:book:<id>/ metadata (title, language, …).
+
+    Returns a dict (may be empty on failure). Used to print the title and
+    to correct OPF metadata when the package still carries another edition.
+    """
+    url = f'{BASE_URL}/api/v2/epubs/urn:orm:book:{book_id}/'
+    try:
+        _assert_url_allowed(url)
+        data = json.loads(await get_with_retry(session, url, max_attempts=5))
+        if isinstance(data, dict):
+            return data
+    except Exception as exc:  # noqa: BLE001
+        log.debug('book info fetch failed for %s: %s', book_id, exc)
+        print(f'  note: could not fetch book metadata ({type(exc).__name__})')
+    return {}
+
+
+def patch_opf_from_book_info(opf_content, info):
+    """Align OPF title/language with the edition metadata from the API.
+
+    download_v2 notes that the OPF may keep another edition's title/language
+    (e.g. English package on a translated listing). Prefer the API values.
+    """
+    if not info:
+        return opf_content
+    if isinstance(opf_content, str):
+        opf_content = opf_content.encode('utf-8')
+    try:
+        tree = etree.fromstring(opf_content)
+    except etree.XMLSyntaxError:
+        return opf_content
+
+    title = (info.get('title') or '').strip()
+    language = (info.get('language') or info.get('lang') or '').strip()
+    if not title and not language:
+        return opf_content
+
+    def _set_text_for_local(local_name, value):
+        if not value:
+            return
+        for el in tree.iter():
+            if _local_tag(el) == local_name:
+                el.text = value
+        # Also dcterms-style meta property=
+        for el in tree.iter():
+            if _local_tag(el) == 'meta':
+                prop = (el.get('property') or '').lower()
+                if prop in (f'dcterms:{local_name}', local_name):
+                    el.text = value
+
+    _set_text_for_local('title', title)
+    _set_text_for_local('language', language)
+
+    return etree.tostring(tree, xml_declaration=True, encoding='utf-8',
+                          pretty_print=True)
+
+
 def to_xhtml(s, root_path, full_path, css_paths=()):
     if isinstance(s, bytes):
         s = _sniff_html_encoding(s)
@@ -1337,7 +1453,9 @@ def to_xhtml(s, root_path, full_path, css_paths=()):
     # contains the sequence '</style>' cannot truncate the block and
     # leave API paths unrewritten.
     s = _pre_rewrite_style_urls(s, root_path, current_dir)
+    s = strip_akamai_from_text(s)
     tree = lhtml.fromstring(s, parser=lhtml.HTMLParser(encoding=None))
+    strip_akamai_injected(tree)
 
     for svg_el in tree.iter('svg'):
         _fix_svg_attribute_case(svg_el)
@@ -1728,6 +1846,16 @@ async def fetch_book(book_id, zfh, session, concurrency=DEFAULT_CONCURRENCY,
     """
     root_path = f'/api/v2/epubs/urn:orm:book:{book_id}/files/'
 
+    book_info = await fetch_book_info(session, book_id)
+    if book_info.get('title'):
+        print(f'  title: {book_info["title"]}')
+        if book_info.get('isbn'):
+            print(f'  isbn:  {book_info["isbn"]}')
+        authors = book_info.get('authors') or []
+        names = [a.get('name') for a in authors if isinstance(a, dict) and a.get('name')]
+        if names:
+            print(f'  authors: {", ".join(names)}')
+
     # mimetype must be first and uncompressed (EPUB spec). container.xml is
     # written later in raw mode once we know the real OPF path; in normal
     # mode it always points at EPUB/content.opf.
@@ -1741,6 +1869,8 @@ async def fetch_book(book_id, zfh, session, concurrency=DEFAULT_CONCURRENCY,
     # before we can correctly process any single HTML page.
     results = []
     url = BASE_URL + root_path
+    if '?' not in url:
+        url = url + '?limit=200'
     while url:
         print(f'listing {url}')
         data = json.loads(await get_with_retry(session, url))
@@ -1905,6 +2035,13 @@ async def fetch_book(book_id, zfh, session, concurrency=DEFAULT_CONCURRENCY,
                 # No nav to inject (or one already present); still run finalize
                 # for dcterms:modified / future hooks.
                 members['content.opf'] = finalize_opf(members['content.opf'])
+
+        # Align package metadata with the edition listed by the Learning API
+        # (fixes wrong title/language on some translated/republished packages).
+        if book_info:
+            members['content.opf'] = patch_opf_from_book_info(
+                members['content.opf'], book_info
+            )
 
     # --- Kindle overflow fix (table / pre / wide media) ---------------------
     if kindle and not raw:
@@ -3298,6 +3435,14 @@ def _sanitize_filename(title):
 
 def main():
     """Entry point with unknown-error catch-all → timestamped error log."""
+    # Book titles are not always printable in the legacy Windows console
+    # code page (download_v2 tip).
+    if hasattr(sys.stdout, 'reconfigure'):
+        try:
+            sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+            sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+        except Exception:
+            pass
     try:
         asyncio.run(amain())
     except KeyboardInterrupt:
