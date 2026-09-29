@@ -27,7 +27,7 @@ Before any usage, please read the [O'Reilly Terms of Service](https://learning.o
 **Important**: since the script only download HTML pages and may create a raw EPUB, many of the CSS and XML/HTML directives may be wrong for an E-Reader. To ensure best quality of the output, I suggest you to always convert the `EPUB` obtained by the script to standard-`EPUB` with [Calibre](https://calibre-ebook.com/).
 You can also use the command-line version of Calibre with `ebook-convert`, e.g.:
 ```bash
-$ ebook-convert "XXXX/safaribooks/Books/Test-Driven Development with Python 2nd Edition (9781491958698)/9781491958698.epub" "XXXX/safaribooks/Books/Test-Driven Development with Python 2nd Edition (9781491958698)/9781491958698_CLEAR.epub"
+$ ebook-convert "9781491958698.epub" "9781491958698_CLEAR.epub"
 ```
 After the execution, you can read the `9781491958698_CLEAR.epub` in every E-Reader and delete all other files.
 
