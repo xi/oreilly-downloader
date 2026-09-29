@@ -42,7 +42,7 @@ python3 oreilly_downloader.py --version
 13. [Security defaults](#security-defaults)
 14. [Safety checks and prompts](#safety-checks-and-prompts)
 15. [Logging and error reports](#logging-and-error-reports)
-16. [Calibre polish](#calibre-polish)
+16. [Calibre EPUB conversion](#calibre-EPUB conversion)
 17. [How it works](#how-it-works)
 18. [Troubleshooting](#troubleshooting)
 19. [Limitations](#limitations)
@@ -483,7 +483,7 @@ Contents include timestamp, Python version, script version, redacted argv, and t
 
 ---
 
-### Calibre EPUB conversion
+## Calibre EPUB conversion
 **Important**: To ensure best quality of the output, I suggest you to always convert the `EPUB` obtained by the script to standard-`EPUB` with [Calibre](https://calibre-ebook.com/).
 
 Even a carefully rewritten EPUB can benefit from Calibre’s normaliser (structure, media types, TOC quirks).
