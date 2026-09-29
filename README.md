@@ -23,8 +23,6 @@ Before any usage, please read the [O'Reilly Terms of Service](https://learning.o
 - Strips Calibre production metadata from the package document when present (common on Manning/O'Reilly packages that were run through Calibre upstream).
 - Normalises OPF media-types for content documents to `application/xhtml+xml`, rewrites NCX `src`/`href` paths, and resolves references against the EPUB root after renaming the package to `content.opf`.
 
-The provided script primarily downloads HTML pages and can generate a raw EPUB file.
-
 #### Calibre EPUB conversion
 **Important**: since the script only download HTML pages and may create a raw EPUB, many of the CSS and XML/HTML directives may be wrong for an E-Reader. To ensure best quality of the output, I suggest you to always convert the `EPUB` obtained by the script to standard-`EPUB` with [Calibre](https://calibre-ebook.com/).
 You can also use the command-line version of Calibre with `ebook-convert`, e.g.:
