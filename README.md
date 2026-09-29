@@ -42,7 +42,7 @@ python3 oreilly_downloader.py --version
 13. [Security defaults](#security-defaults)
 14. [Safety checks and prompts](#safety-checks-and-prompts)
 15. [Logging and error reports](#logging-and-error-reports)
-16. [Calibre EPUB conversion](#calibre-EPUB conversion)
+16. [Calibre EPUB conversion](#calibre-epub-conversion)
 17. [How it works](#how-it-works)
 18. [Troubleshooting](#troubleshooting)
 19. [Limitations](#limitations)
