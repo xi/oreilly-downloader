@@ -15,7 +15,7 @@ O'Reilly Learning (formerly Safari Books Online) serves its library through a we
 | **Book lists** | `books.txt` / `sources.txt` |
 | **Report bugs** | [https://github.com/official-kandoamoa](https://github.com/official-kandoamoa) (open a GitHub Issue) |
 
-Before any use, please read the [O'Reilly Terms of Service](https://learning.oreilly.com/terms/). This tool is intended for **personal, offline access** to titles covered by your legitimate subscription — **not** for redistribution or sharing copyrighted files.
+Before any use, please read the [O'Reilly Terms of Service](https://learning.oreilly.com/terms/) (open in a normal browser if the link is blocked on a restricted network). This tool is intended for **personal, offline access** to titles covered by your legitimate subscription — **not** for redistribution or sharing copyrighted files.
 
 ```bash
 python3 oreilly_downloader.py              # quick reference card
@@ -86,7 +86,7 @@ python3 oreilly_downloader.py --version
 
 - `--books` / `books.txt` multi-title lists with optional display titles.
 - `--save-options` / `.oreilly_options.json` to remember `--cookies`, `--calibre`, etc.
-- `--raw` archival dump; `--calibre` EPUB→EPUB polish via Calibre.
+- `--raw` archival dump; `--calibre` EPUB→EPUB polish via Calibre; `--kindle` overflow CSS for tables/pre on E-Ink.
 - No-argument invocation prints a quick reference; `--help` prints a detailed guide.
 - Editable `CONFIG` dictionary at the top of the script for defaults.
 
@@ -209,7 +209,7 @@ Use when exports keep failing or Akamai blocks scripted requests:
 python3 oreilly_downloader.py 9781098148706 --cookies cookies.json --webview
 ```
 
-Opens a native browser window, lets you log in normally, then captures cookies (including sensor cookies) and saves them to `--cookies` when provided. Requires a graphical session (not plain SSH without display forwarding).
+Opens a native browser window, lets you log in normally, then captures cookies (including sensor cookies) and saves them to `--cookies` when provided. Requires a graphical session (not plain SSH without display forwarding). Install with `pip install pywebview`; on Linux you may need WebKitGTK (see [pywebview installation notes](https://pywebview.flowrl.com/)). Profile data is stored under `--webview-profile` or a default folder next to your cookies file.
 
 ### Missing or empty credentials
 
@@ -243,6 +243,7 @@ python3 oreilly_downloader.py --books FILE [options]
 | `--force` | Ignore on-disk cache; re-fetch every file. |
 | `--raw` | No content rewriting; output `<id>-raw.epub`. |
 | `--calibre` | After a successful build, run Calibre `ebook-convert` (EPUB→EPUB). Exits early if `ebook-convert` is missing. |
+| `--kindle` | Inject CSS so `table` / `pre` wrap and do not overflow on narrow Kindle / E-Ink screens. Ignored with `--raw`. |
 | `--no-nav` | Do not synthesise EPUB3 `nav.xhtml` (ignored in `--raw` mode). |
 | `--webview` | Interactive browser login when needed. |
 | `--webview-profile PATH` | Directory for the embedded browser profile. |
@@ -286,6 +287,10 @@ ebook-convert input.epub input.calibre.epub
 
 As root, sets `QTWEBENGINE_DISABLE_SANDBOX=1`. If Calibre is not installed, the script **exits before downloading** when `--calibre` was requested, and points you to [https://calibre-ebook.com/](https://calibre-ebook.com/).
 
+### `--kindle`
+
+Injects `Styles/kindle-fix.css` and links it from every chapter so wide **tables** and **`<pre>`** blocks wrap/scroll on narrow screens (Kindle, other E-Ink). Also caps image width. Has no effect with `--raw`. See [Calibre EPUB conversion](#calibre-epub-conversion) for AZW3 tips.
+
 ---
 
 ## Batch download
@@ -296,8 +301,8 @@ As root, sets `QTWEBENGINE_DISABLE_SANDBOX=1`. If Calibre is not installed, the 
 
 ```text
 # comments and blank lines ignored
-9781098148706 # "Math for Programmers"
-9781098148706 # 'Grokking Deep Learning'
+9781617295355 # "Math for Programmers"
+9781633437777 # 'Grokking Deep Learning'
 9781098104030
 ```
 
@@ -307,8 +312,8 @@ Rules:
 | --- | --- |
 | Separator | A single `#` between id and optional title |
 | Book id | Digits only |
-| Multiple `#` | Line rejected (`test # test # test`) |
-| Non-numeric id | Line rejected (`test # test`) |
+| Multiple `#` | Line rejected (`jeleo # 83hd # heoo`) |
+| Non-numeric id | Line rejected (`jfjd # ejsk`) |
 | Titles | Optional quotes; sanitised for Windows / Linux / Android file names |
 
 ```bash
@@ -359,7 +364,7 @@ Creates or updates `.oreilly_options.json` (path overridable via `CONFIG['option
 
 ```bash
 python3 oreilly_downloader.py --print-options
-python3 oreilly_downloader.py 9781098148706   # uses saved defaults
+python3 oreilly_downloader.py 9781617295355   # uses saved defaults
 ```
 
 - **CLI always wins** over the file.
@@ -372,28 +377,107 @@ python3 oreilly_downloader.py 9781098148706   # uses saved defaults
 
 ## Configuration (`CONFIG`)
 
-Near the top of `oreilly_downloader.py` is an editable dictionary. Change defaults without touching the rest of the code. **CLI flags override CONFIG.**
+Near the top of `oreilly_downloader.py` (search for `CONFIG = {`) is a plain Python dictionary. **Edit these values** to change defaults without rewriting CLI flags every time. Anything you pass on the command line still **overrides** `CONFIG`.
 
-| Key | Role |
-| --- | --- |
-| `cookies_path` | Used when `--cookies` is omitted and the file exists |
-| `cache_dir` | Download cache root |
-| `concurrency` | Default parallel downloads |
-| `books_file` | Default list file name |
-| `error_log_dir` | Directory for crash logs |
-| `make_nav` | Synthesise EPUB3 nav when possible |
-| `calibre_polish` | Act as if `--calibre` were always passed |
-| `raw` | Act as if `--raw` were always passed |
-| `output_suffix` | Optional extra suffix before `.epub` |
-| `extra_headers` | Extra HTTP headers (advanced) |
-| `options_file` | Path for `--save-options` |
-| `auto_save_options` | Save options after every success |
-| `api_version` | Expected API major version (default `2`) |
-| `check_connectivity` | Run site/API probes |
-| `http_timeout_total` / `_connect` / `_sock_read` | aiohttp timeouts (seconds) |
-| `max_response_bytes` | Per-file size cap (default 80 MiB; `0` = unlimited) |
-| `allowed_hosts` | URL host allowlist suffixes |
-| `cookies_file_mode` | Unix mode for saved cookies (default `0o600`) |
+```python
+CONFIG = {
+    'cookies_path': 'cookies.json',
+    'cache_dir': '.oreilly_cache',
+    'concurrency': 8,
+    'books_file': 'books.txt',
+    'error_log_dir': 'error_logs',
+    'make_nav': True,
+    'calibre_polish': False,
+    'raw': False,
+    'kindle_fix': False,
+    'output_suffix': '',
+    'extra_headers': {},
+    'http_timeout_total': 120,
+    'http_timeout_connect': 30,
+    'http_timeout_sock_read': 90,
+    'max_response_bytes': 80 * 1024 * 1024,
+    'allowed_hosts': ('oreilly.com', 'learning.oreilly.com'),
+    'cookies_file_mode': 0o600,
+    'api_version': 2,
+    'check_connectivity': True,
+    'options_file': '.oreilly_options.json',
+    'auto_save_options': False,
+}
+```
+
+### Paths and files
+
+| Key | Type | Default | Detail |
+| --- | --- | --- | --- |
+| `cookies_path` | `str` or usable path | `'cookies.json'` | If you omit `--cookies` and this file **exists** in the working directory, it is loaded automatically. Set to another filename (e.g. `'~/oreilly/cookies.json'`) if you keep exports elsewhere. Does **not** create the file for you — you must export cookies from a browser first. |
+| `cache_dir` | `str` | `'.oreilly_cache'` | Root directory for per-book raw API caches. Actual files live under `<cache_dir>/<book_id>/…`. Override per run with `--cache-dir`. Safe to delete anytime to free space; the next run re-downloads. |
+| `books_file` | `str` | `'books.txt'` | Default multi-book list. If you run the script with **no** `book_id` and **no** `--books`, and this file exists, it is used automatically. Format: one `BOOK_ID` or `BOOK_ID # "Title"` per line (see [Batch download](#batch-download)). |
+| `error_log_dir` | `str` | `'error_logs'` | Directory for crash logs named `error_log_YYYY_MM_DD_HHMMSS.log`. Created on demand. Logs redact JWTs and long tokens. |
+| `options_file` | `str` | `'.oreilly_options.json'` | JSON file written by `--save-options` / read on startup as CLI defaults. See [Saved options](#saved-options). |
+
+### Download behaviour
+
+| Key | Type | Default | Detail |
+| --- | --- | --- | --- |
+| `concurrency` | `int` | `8` | How many chapter/asset downloads run in parallel. Lower this (e.g. `3`–`4`) if you see many `403` responses on large books (rate limiting). CLI: `--concurrency N` (capped at 64). |
+| `raw` | `bool` | `False` | When `True`, behaves as if every run passed `--raw`: no HTML/CSS/OPF rewriting, output `<id>-raw.epub`. Prefer CLI `--raw` for one-offs so you do not leave archival mode on by accident. |
+| `make_nav` | `bool` | `True` | When `True` (and not in raw mode), if the package has an NCX but no EPUB3 nav document, synthesise `nav.xhtml` and register it in the OPF. Set `False` to match `--no-nav` always. |
+| `calibre_polish` | `bool` | `False` | When `True`, always run Calibre `ebook-convert` (EPUB→EPUB) after a successful build — same as passing `--calibre` every time. Requires `ebook-convert` on `PATH` or the run aborts before download. |
+| `kindle_fix` | `bool` | `False` | When `True`, always inject Kindle overflow CSS (`table` / `pre` / images) — same as `--kindle`. Ignored when `raw` / `--raw` is active. |
+| `output_suffix` | `str` | `''` | Optional string inserted before `.epub` in the numeric filename, e.g. `'_v2'` → `978…_v2.epub`. Title-based names from book lists are not affected unless you rename manually. Leave empty for normal names. |
+
+### Network and security
+
+| Key | Type | Default | Detail |
+| --- | --- | --- | --- |
+| `http_timeout_total` | `float` (seconds) | `120` | Overall timeout for a single HTTP request (aiohttp `ClientTimeout.total`). Increase on very slow links; decrease to fail faster. |
+| `http_timeout_connect` | `float` | `30` | Max time to establish the TCP/TLS connection. |
+| `http_timeout_sock_read` | `float` | `90` | Max idle time while reading the response body. Large images on slow networks may need a higher value. |
+| `max_response_bytes` | `int` | `80 * 1024 * 1024` (80 MiB) | Maximum size of one downloaded file. Larger responses are aborted to protect disk. Set to `0` to disable the cap (not recommended on shared or small volumes). |
+| `allowed_hosts` | `tuple` of `str` | `('oreilly.com', 'learning.oreilly.com')` | A request URL’s host must equal one of these or be a subdomain (e.g. `www.oreilly.com`). Any other host is refused. Do not add arbitrary hosts unless you know why. |
+| `cookies_file_mode` | `int` (octal) | `0o600` | Unix file mode applied after writing cookies (owner read/write only). Ignored on Windows. Set `0` only if you must disable chmod (not recommended). |
+| `api_version` | `int` | `2` | Major version embedded in API paths (`/api/v2/...`). Used by the connectivity probe. Change only when the project is updated for a new O'Reilly API generation. |
+| `check_connectivity` | `bool` | `True` | When `True`, probe the site and API before downloading. Set `False` or pass `--skip-connectivity` to skip (offline debugging only). |
+
+### HTTP headers (advanced)
+
+| Key | Type | Default | Detail |
+| --- | --- | --- | --- |
+| `extra_headers` | `dict` | `{}` | Merged on top of the script’s built-in `User-Agent` / `Referer` / etc. Example: `{'User-Agent': 'Mozilla/5.0 ...'}`. Leave empty unless you are diagnosing header-related blocks. |
+
+### Saved-options automation
+
+| Key | Type | Default | Detail |
+| --- | --- | --- | --- |
+| `auto_save_options` | `bool` | `False` | When `True`, after every **successful** run the script writes the current common flags to `options_file` (same as always passing `--save-options`). Useful if you want the last working `--cookies` path remembered automatically. **Never** stores `--jwt`. |
+
+### Precedence (what wins?)
+
+From lowest to highest priority:
+
+1. Built-in script defaults  
+2. Values in `CONFIG`  
+3. Values loaded from `options_file` (`.oreilly_options.json`)  
+4. Explicit command-line flags  
+
+Example: `CONFIG['concurrency'] = 4`, options file has `"concurrency": 6`, CLI has `--concurrency 10` → **10** is used.
+
+### Practical recipes
+
+```python
+# Always polish with Calibre + Kindle CSS; cookies next to the script
+CONFIG['cookies_path'] = 'cookies.json'
+CONFIG['calibre_polish'] = True
+CONFIG['kindle_fix'] = True
+
+# Slow or flaky network
+CONFIG['concurrency'] = 3
+CONFIG['http_timeout_total'] = 300
+CONFIG['http_timeout_sock_read'] = 180
+
+# Remember last flags without typing --save-options
+CONFIG['auto_save_options'] = True
+```
 
 ---
 
@@ -431,16 +515,18 @@ This script is built for **API version 2** (`/api/v2/epubs/urn:orm:book:…/file
 
 ## Security defaults
 
+These are always on unless you deliberately change `CONFIG` (there is **no** `--insecure` flag to disable TLS).
+
 | Control | Behaviour |
 | --- | --- |
-| TLS | Certificate verification remains enabled |
-| Hosts | Only hosts under `allowed_hosts` (default `*.oreilly.com`) |
-| Timeouts | Connect / read / total limits from CONFIG |
-| Size | Default max 80 MiB per response |
-| Cookies file | `chmod` to owner-only (`0600`) on Unix when saving |
-| Logs | JWTs and long tokens redacted in `--log` and `error_logs/*` |
-| CLI log | `--jwt` value not written to debug logs as plaintext |
-| Subprocess | Calibre invoked as an argument list (no shell) |
+| TLS | Certificate verification stays enabled (aiohttp default). The script never sets `ssl=False`. |
+| Hosts | Only hosts under `CONFIG['allowed_hosts']` (default `oreilly.com` and `learning.oreilly.com`, including subdomains). Other hosts are refused before the request is sent. |
+| Timeouts | `http_timeout_connect` / `http_timeout_sock_read` / `http_timeout_total` apply to every API request. |
+| Size | Each response is capped by `max_response_bytes` (default 80 MiB) so a runaway body cannot fill the disk. |
+| Cookies file | After `save_cookies`, Unix systems apply `cookies_file_mode` (default `0o600`) so other accounts cannot read tokens. |
+| Logs | JWTs (`eyJ…`) and long opaque tokens are replaced with `[REDACTED_…]` in `--log` files and `error_logs/*`. |
+| CLI log | If you pass `--jwt`, the value is stored as `[REDACTED]` in structured debug logs. |
+| Subprocess | `ebook-convert` is started with an argument list only (`shell=False`). |
 
 ---
 
@@ -484,29 +570,47 @@ Contents include timestamp, Python version, script version, redacted argv, and t
 ---
 
 ## Calibre EPUB conversion
-**Important**: To ensure best quality of the output, I suggest you to always convert the `EPUB` obtained by the script to standard-`EPUB` with [Calibre](https://calibre-ebook.com/).
 
-Even a carefully rewritten EPUB can benefit from Calibre’s normaliser (structure, media types, TOC quirks).
+**Important:** For the best reader compatibility, polish the EPUB with [Calibre](https://calibre-ebook.com/) after download (structure, media types, TOC).
+
+### Built-in `--calibre`
 
 ```bash
 python3 oreilly_downloader.py 9781491958698 --cookies cookies.json --calibre
 ```
 
-You can also use the command-line version of Calibre with `ebook-convert`, e.g.:
+If `ebook-convert` is missing, the script exits **before** downloading and points you to the official installer.
+
+### Manual conversion
 
 ```bash
 ebook-convert "9781491958698.epub" "9781491958698_CLEAR.epub"
 ```
 
-After the execution, you can read the `9781491958698_CLEAR.epub` in every E-Reader and delete all other files.
+You can then keep the polished file and remove intermediates if you want.
 
-The program offers also an option to ensure best compatibilities for who wants to export the `EPUB` to E-Readers like Amazon Kindle: `--kindle`, it blocks overflow on `table` and `pre` elements (see [example](#use-or-not-the---kindle-option)).  
-In this case, I suggest you to convert the `EPUB` to `AZW3` with Calibre or to `MOBI`, remember in this case to select `Ignore margins` in the conversion options:  
-  
-![Calibre IgnoreMargins](https://github.com/lorenzodifuccia/cloudflare/raw/master/Images/safaribooks/safaribooks_calibre_IgnoreMargins.png "Select Ignore margins")  
+### `--kindle` (table / pre overflow)
 
-Install from the official site: [https://calibre-ebook.com/](https://calibre-ebook.com/).  
-Credit for documenting the polish workflow in similar tools: [lorenzodifuccia/safaribooks](https://github.com/lorenzodifuccia/safaribooks).
+For Amazon Kindle and other narrow E-Ink screens, wide tables and preformatted code often overflow or clip. **`--kindle`** injects a small stylesheet (`Styles/kindle-fix.css`) that:
+
+- Constrains `table` width and allows horizontal scrolling instead of blowing the page layout
+- Enables `pre` / `code` wrapping (`white-space: pre-wrap`) and overflow control
+- Caps `img` / `svg` to `max-width: 100%`
+
+```bash
+python3 oreilly_downloader.py 9781491958698 --cookies cookies.json --kindle
+python3 oreilly_downloader.py 9781491958698 --cookies cookies.json --kindle --calibre
+```
+
+Ignored with `--raw` (no HTML/OPF rewriting). You can also set `CONFIG['kindle_fix'] = True`.
+
+When targeting Kindle specifically, convert the result to **AZW3** (or MOBI) in Calibre and enable **Ignore margins** in the conversion options:
+
+![Calibre IgnoreMargins](https://github.com/lorenzodifuccia/cloudflare/raw/master/Images/safaribooks/safaribooks_calibre_IgnoreMargins.png "Select Ignore margins")
+
+Install Calibre from [https://calibre-ebook.com/](https://calibre-ebook.com/).  
+Workflow notes adapted from [lorenzodifuccia/safaribooks](https://github.com/lorenzodifuccia/safaribooks).
+
 
 ---
 

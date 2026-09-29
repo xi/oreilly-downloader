@@ -6,8 +6,8 @@
 #   ./batch_download.sh BOOK_ID [BOOK_ID ...] [options...]
 #
 # sources.txt format (one entry per line):
-#   9781098148706 # "Math for Programmers"
-#   9781098148706 # "Some Other Book"
+#   9781617295355 # "Math for Programmers"
+#   9781633437777 # "Some Other Book"
 #   9781492052203
 #
 # Rules:
@@ -39,8 +39,8 @@ Usage:
   batch_download.sh BOOK_ID [BOOK_ID ...] [downloader options...]
 
 sources.txt format (one per line):
-  9781098148706 # "Math for Programmers"
-  9781098148706 # 'Another Title'
+  9781617295355 # "Math for Programmers"
+  9781633437777 # 'Another Title'
   9781492052203 # Plain title without quotes
   9781098104030
 
@@ -78,7 +78,7 @@ Runner order:
 Examples:
   ./batch_download.sh -f sources.txt --cookies cookies.json
   ./batch_download.sh -f sources.txt --cookies cookies.json --raw --calibre
-  ./batch_download.sh 9781098148706 --cookies cookies.json --calibre
+  ./batch_download.sh 9781617295355 --cookies cookies.json --calibre
 
 Exit code:
   0 if every book succeeded, 1 if any failed (others still attempted).
@@ -89,30 +89,40 @@ EOF
 # Sanitize a book title into a safe filename stem (no extension).
 # Safe on Windows, Linux, macOS, and Android filesystems.
 sanitize_title() {
+  # Safe filename stem for Windows / Linux / Android.
+  # Includes safaribooks-style "Title: Subtitle" truncation and a broader
+  # set of characters replaced with underscore.
   local s="$1"
-  # Strip C0 controls and DEL
   s="$(printf '%s' "$s" | tr -d '\000-\037\177')"
-  # Characters illegal on Windows (also unsafe on Android/Linux paths)
-  s="$(printf '%s' "$s" | sed 's#[/\\:*?"<>|]##g')"
-  # Collapse whitespace to single spaces
+
+  if [[ "$s" == *:* ]]; then
+    local before="${s%%:*}"
+    if [[ ${#before} -gt 15 ]]; then
+      s="$before"
+    else
+      case "$(uname -s 2>/dev/null)" in
+        MINGW*|MSYS*|CYGWIN*) s="${s//:/,}" ;;
+        *) s="${s//:/_}" ;;
+      esac
+    fi
+  fi
+
+  s="$(printf '%s' "$s" | sed 's#[~#%&*{}\\<>?/`'"'"'"|+;:]#_#g')"
   s="$(printf '%s' "$s" | sed 's/[[:space:]]\+/ /g')"
-  # Trim leading/trailing spaces and dots (Windows forbids trailing dot/space)
   s="$(printf '%s' "$s" | sed 's/^[[:space:].]*//;s/[[:space:].]*$//')"
-  # Windows reserved device names (any extension)
   case "$(printf '%s' "$s" | tr '[:lower:]' '[:upper:]')" in
     CON|PRN|AUX|NUL|COM[0-9]|LPT[0-9]) s="${s}_book" ;;
   esac
-  # Avoid empty result
   if [[ -z "$s" ]]; then
     s="book"
   fi
-  # Cap length (Android/ext4/Windows MAX_PATH friendliness for the stem)
   if [[ ${#s} -gt 180 ]]; then
     s="${s:0:180}"
     s="$(printf '%s' "$s" | sed 's/[[:space:].]*$//')"
   fi
   printf '%s' "$s"
 }
+
 
 parse_source_line() {
   # Parse "BOOK_ID" or "BOOK_ID # title". Sets PARSE_ID, PARSE_TITLE.
@@ -270,7 +280,7 @@ while [[ $# -gt 0 ]]; do
       passthrough+=("$1")
       shift
       ;;
-    --force|--no-nav|--webview|--raw|--calibre|--verbose|-v)
+    --force|--no-nav|--webview|--raw|--calibre|--kindle|--verbose|-v)
       if [[ "$1" == "--raw" ]]; then
         USE_RAW=1
       fi

@@ -16,11 +16,11 @@ QUICK START
        site" to cookies.json. You do not need to hand-pick which cookies;
        anything not scoped to oreilly.com is ignored automatically.
     3. Find the book's ID: it's the digits in the book's learning.oreilly.com
-       URL, e.g. for https://learning.oreilly.com/library/view/some-book/9781098148706/
-       the id is 9781098148706.
+       URL, e.g. for https://learning.oreilly.com/library/view/some-book/9781633437777/
+       the id is 9781633437777.
     4. Run:
-           python3 oreilly_downloader.py 9781098148706 --cookies cookies.json
-       This writes 9781098148706.epub in the current directory.
+           python3 oreilly_downloader.py 9781633437777 --cookies cookies.json
+       This writes 9781633437777.epub in the current directory.
 
     Re-run the exact same command whenever you need another book (with a
     different id) - --cookies keeps itself up to date (see below), so you
@@ -77,7 +77,7 @@ IF AUTHENTICATION FAILS
     display (X11/Wayland/macOS/Windows desktop); it will not work over a
     plain SSH terminal or inside a headless container. Combine with
     --cookies so the result is saved for next time rather than used once:
-        python3 oreilly_downloader.py 9781098148706 --cookies cookies.json --webview
+        python3 oreilly_downloader.py 9781633437777 --cookies cookies.json --webview
     --webview-profile controls where pywebview keeps its own persistent
     browser profile between runs (default: a folder next to --cookies), so
     in practice logging in is a one-time thing, not a per-run one.
@@ -353,6 +353,8 @@ CONFIG = {
 
     # When True, package API bytes with no rewriting (archival)
     'raw': False,
+    # Inject Kindle overflow CSS (table/pre) when True
+    'kindle_fix': False,
 
     # Append this suffix to polished/raw outputs only when non-empty
     # (leave '' for default naming: <id>.epub / <id>-raw.epub)
@@ -704,6 +706,31 @@ DEFAULT_CACHE_DIR = CONFIG.get('cache_dir', '.oreilly_cache')
 
 # Fixed path of the synthesised EPUB3 nav document inside the EPUB.
 NAV_PATH = 'nav.xhtml'
+KINDLE_CSS_PATH = 'Styles/kindle-fix.css'
+KINDLE_CSS = b"""/* Injected by oreilly_downloader --kindle
+ * Adapted from safaribooks-style rules for narrow E-Ink / Kindle screens.
+ */
+* {
+  word-wrap: break-word !important;
+  word-break: break-word !important;
+}
+table, pre {
+  overflow-x: unset !important;
+  overflow-y: unset !important;
+  overflow: unset !important;
+  white-space: pre-wrap !important;
+  max-width: 100% !important;
+}
+pre, pre code, code {
+  white-space: pre-wrap !important;
+  word-wrap: break-word !important;
+  max-width: 100% !important;
+}
+img, svg {
+  max-width: 100% !important;
+  height: auto !important;
+}
+"""
 
 
 def _local_tag(el):
@@ -1003,7 +1030,128 @@ def _ensure_dcterms_modified(tree):
     meta.text = stamp
 
 
+
+def apply_kindle_fixes(members):
+    """Inject CSS that constrains overflow on table/pre (and wide media).
+
+    Adds Styles/kindle-fix.css, registers it in content.opf, and links it
+    from every HTML/XHTML content document so Kindle / narrow E-Ink readers
+    wrap code blocks and tables instead of clipping or forcing huge widths.
+    Mutates members in place. Returns True if applied.
+    """
+    if 'content.opf' not in members:
+        return False
+
+    css_path = KINDLE_CSS_PATH
+    members[css_path] = KINDLE_CSS
+
+    # --- OPF manifest item ---
+    opf = members['content.opf']
+    if isinstance(opf, str):
+        opf = opf.encode('utf-8')
+    try:
+        tree = etree.fromstring(opf)
+    except etree.XMLSyntaxError:
+        return False
+
+    manifest = None
+    for el in tree.iter():
+        if _local_tag(el) == 'manifest':
+            manifest = el
+            break
+    if manifest is None:
+        return False
+
+    # Skip if already registered
+    already = False
+    for el in manifest:
+        if _local_tag(el) == 'item' and el.get('href') == css_path:
+            already = True
+            break
+    if not already:
+        existing_ids = {
+            el.get('id') for el in manifest
+            if _local_tag(el) == 'item' and el.get('id')
+        }
+        kid = 'kindle-fix'
+        n = 1
+        while kid in existing_ids:
+            n += 1
+            kid = f'kindle-fix-{n}'
+        namespaced = any(
+            isinstance(c.tag, str) and c.tag.startswith('{')
+            for c in manifest
+        )
+        tag = f'{{{_OPF_NS}}}item' if namespaced else 'item'
+        item = etree.SubElement(manifest, tag)
+        item.set('id', kid)
+        item.set('href', css_path)
+        item.set('media-type', 'text/css')
+
+    members['content.opf'] = etree.tostring(
+        tree, xml_declaration=True, encoding='utf-8', pretty_print=True
+    )
+
+    # --- link from each HTML document ---
+    for path, content in list(members.items()):
+        if not path.endswith(HTML_EXTENSIONS):
+            continue
+        if isinstance(content, str):
+            content = content.encode('utf-8')
+        try:
+            # Prefer XML parse for XHTML; fall back to HTML
+            try:
+                doc = etree.fromstring(content)
+            except etree.XMLSyntaxError:
+                doc = lhtml.fromstring(content)
+        except Exception:
+            continue
+
+        # Find head
+        head = None
+        for el in doc.iter():
+            if _local_tag(el) == 'head':
+                head = el
+                break
+        if head is None:
+            # create head under html root
+            root = doc
+            if _local_tag(root) != 'html':
+                continue
+            head = etree.Element('head')
+            root.insert(0, head)
+
+        # Relative href from this file to css_path
+        href = _relpath(css_path, posixpath.dirname(path) or '.')
+        # Avoid duplicate links
+        dup = False
+        for link in head.iter():
+            if _local_tag(link) == 'link' and link.get('href') == href:
+                dup = True
+                break
+        if not dup:
+            link = etree.SubElement(head, 'link')
+            link.set('rel', 'stylesheet')
+            link.set('type', 'text/css')
+            link.set('href', href)
+
+        try:
+            out = etree.tostring(
+                doc,
+                xml_declaration=True,
+                doctype='<!DOCTYPE html>',
+                pretty_print=True,
+                encoding='utf-8',
+            )
+        except Exception:
+            out = etree.tostring(doc, encoding='utf-8')
+        members[path] = out
+
+    return True
+
+
 def finalize_opf(opf_content, *, nav_path=None, bump_to_epub3=False):
+
     """Post-process the rewritten OPF: optionally register a synthesised
     nav document, ensure dcterms:modified, and bump package version to 3.0
     when dual NCX+nav is in use.
@@ -1559,7 +1707,8 @@ def _safe_cache_path(cache_root, full_path):
 
 
 async def fetch_book(book_id, zfh, session, concurrency=DEFAULT_CONCURRENCY,
-                     cache_dir=None, force=False, make_nav=True, raw=False):
+                     cache_dir=None, force=False, make_nav=True, raw=False,
+                     kindle=False):
     """Download every file listed for the book and write them into zfh.
 
     Normal mode (raw=False):
@@ -1756,6 +1905,16 @@ async def fetch_book(book_id, zfh, session, concurrency=DEFAULT_CONCURRENCY,
                 # No nav to inject (or one already present); still run finalize
                 # for dcterms:modified / future hooks.
                 members['content.opf'] = finalize_opf(members['content.opf'])
+
+    # --- Kindle overflow fix (table / pre / wide media) ---------------------
+    if kindle and not raw:
+        if apply_kindle_fixes(members):
+            print(f'  added Kindle overflow CSS ({KINDLE_CSS_PATH})')
+        else:
+            print('  warning: --kindle requested but could not inject CSS')
+    elif kindle and raw:
+        print('  note: --kindle is ignored in --raw mode '
+              '(no HTML/OPF rewriting)')
 
     # Single-threaded write after gather — ZipFile is not concurrent-safe.
     for out_path, content in members.items():
@@ -2348,7 +2507,7 @@ def _validate_cli_args(args):
 # Keys we persist in the options file (no secrets like jwt values).
 _SAVED_OPTION_KEYS = (
     'cookies', 'concurrency', 'cache_dir', 'output_dir', 'books',
-    'webview_profile', 'log', 'raw', 'calibre', 'no_nav', 'force',
+    'webview_profile', 'log', 'raw', 'calibre', 'kindle', 'no_nav', 'force',
     'verbose', 'skip_connectivity',
 )
 
@@ -2419,14 +2578,14 @@ def print_quick_reference():
         f"       python3 {prog} BOOK_ID --cookies cookies.json",
         "",
         "Examples",
-        f"  python3 {prog} 9781098148706 --cookies cookies.json",
-        f"  python3 {prog} 9781098148706 --cookies cookies.json --calibre",
+        f"  python3 {prog} 9781617295355 --cookies cookies.json",
+        f"  python3 {prog} 9781617295355 --cookies cookies.json --calibre",
         f"  python3 {prog} --books books.txt --cookies cookies.json",
-        f"  python3 {prog} 9781098148706 --cookies cookies.json --raw --calibre",
+        f"  python3 {prog} 9781617295355 --cookies cookies.json --raw --calibre",
         f"  python3 {prog} --cookies cookies.json --webview",
         "",
         "Common options",
-        "  BOOK_ID              Digits from the book URL (.../9781098148706/)",
+        "  BOOK_ID              Digits from the book URL (.../9781617295355/)",
         "  --cookies PATH       Browser cookie export (recommended)",
         "  --books FILE         List of ids:  978... # \"Title\"",
         "  --calibre            Polish EPUB with Calibre ebook-convert",
@@ -2442,8 +2601,8 @@ def print_quick_reference():
         "  -h, --help           Full detailed help",
         "",
         "books.txt format",
-        '  9781098148706 # "Math for Programmers"',
-        "  9781098148706",
+        '  9781617295355 # "Math for Programmers"',
+        "  9781633437777",
         "",
         f"Need more detail?  Run:  python3 {prog} --help",
         f"Report bugs:  {REPORT_URL}",
@@ -2479,8 +2638,8 @@ async def amain():
             "\n"
             "BOOK ID\n"
             "  From the book URL on learning.oreilly.com, e.g.\n"
-            "    https://learning.oreilly.com/library/view/some-book/9781098148706/\n"
-            "  -> book_id is 9781098148706 (digits only).\n"
+            "    https://learning.oreilly.com/library/view/some-book/9781633437777/\n"
+            "  -> book_id is 9781633437777 (digits only).\n"
             "\n"
             "AUTHENTICATION\n"
             "  --cookies PATH   Preferred. Export all cookies for\n"
@@ -2502,8 +2661,8 @@ async def amain():
             "\n"
             "BATCH / LISTS\n"
             "  --books FILE     One book per line:\n"
-            '                     9781098148706 # "Title Here"\n'
-            "                     9781098148706\n"
+            '                     9781617295355 # "Title Here"\n'
+            "                     9781633437777\n"
             "                   book_id must be digits; only one # separator.\n"
             "  --output-dir DIR Write EPUBs into DIR.\n"
             "\n"
@@ -2535,8 +2694,8 @@ async def amain():
             "  CLI flags always override CONFIG.\n"
             "\n"
             "EXAMPLES\n"
-            "  python3 oreilly_downloader.py 9781098148706 --cookies cookies.json\n"
-            "  python3 oreilly_downloader.py 9781098148706 --cookies cookies.json --calibre\n"
+            "  python3 oreilly_downloader.py 9781633437777 --cookies cookies.json\n"
+            "  python3 oreilly_downloader.py 9781633437777 --cookies cookies.json --calibre\n"
             "  python3 oreilly_downloader.py --books books.txt --cookies cookies.json\n"
             "  python3 oreilly_downloader.py --cookies cookies.json --webview\n"
             "\n"
@@ -2636,6 +2795,13 @@ async def amain():
         "missing tooling. As root, sets QTWEBENGINE_DISABLE_SANDBOX=1 "
         "automatically. Especially useful with --raw."
     ))
+    parser.add_argument('--kindle', action='store_true', help=(
+        "Inject CSS that constrains overflow on table and pre elements "
+        "(and caps image width) for better display on Amazon Kindle and "
+        "other narrow E-Ink readers. Ignored with --raw. Often combined "
+        "with --calibre, then convert to AZW3/MOBI in Calibre with "
+        "'Ignore margins' enabled."
+    ))
     parser.add_argument('--log', metavar='PATH', default=None, help=(
         "Write a detailed debug log to PATH (created if missing). Useful for "
         "diagnosing auth, path rewriting, and download failures. Console "
@@ -2729,6 +2895,8 @@ async def amain():
         args.raw = True
     if CONFIG.get('calibre_polish'):
         args.calibre = True
+    if CONFIG.get('kindle_fix'):
+        args.kindle = True
     if CONFIG.get('make_nav') is False:
         args.no_nav = True
 
@@ -2834,7 +3002,7 @@ async def amain():
         if not str(args.book_id).isdigit():
             _die(
                 f'error: book id must be digits only, got {args.book_id!r}\n'
-                f'  Example: 9781098148706\n'
+                f'  Example: 9781617295355\n'
                 + report_hint()
             )
         # Avoid duplicating if the same id is also in the books file
@@ -2849,13 +3017,13 @@ async def amain():
     if not jobs:
         _die(
             'error: no books to download.\n'
-            '  Pass a book id:  python3 oreilly_downloader.py 9781098148706 '
+            '  Pass a book id:  python3 oreilly_downloader.py 9781617295355 '
             '--cookies cookies.json\n'
             '  Or a list file:  python3 oreilly_downloader.py --books books.txt '
             '--cookies cookies.json\n'
             f'  Or create {CONFIG.get("books_file", "books.txt")!r} '
             f'(CONFIG books_file) with lines like:\n'
-            '    9781098148706 # "Math for Programmers"'
+            '    9781617295355 # "Math for Programmers"'
         )
 
     out_dir = args.output_dir or '.'
@@ -3063,6 +3231,7 @@ async def _download_one_book(args, records, session_headers, filename, tmp_filen
                         force=args.force,
                         make_nav=not args.no_nav,
                         raw=args.raw,
+                        kindle=args.kindle,
                     )
                 finally:
                     if args.cookies:
@@ -3089,10 +3258,31 @@ async def _download_one_book(args, records, session_headers, filename, tmp_filen
 
 
 def _sanitize_filename(title):
-    """Make a title safe for Windows / Linux / Android filenames."""
+    """Make a title safe for Windows / Linux / Android filenames.
+
+    Incorporates practical rules from the classic safaribooks downloader:
+    - Long "Title: Subtitle …" strings keep only the part before the first
+      colon when the colon appears after position 15 (avoids huge filenames).
+    - On Windows, a short leading colon form is turned into a comma.
+    - A broader set of unsafe characters is replaced with underscore.
+    """
     import re as _re
-    s = ''.join(ch for ch in title if ord(ch) >= 32 and ord(ch) != 127)
-    s = _re.sub(r'[/\\\\:*?"<>|]', '', s)
+    s = str(title or '')
+    s = ''.join(ch for ch in s if ord(ch) >= 32 and ord(ch) != 127)
+
+    if ':' in s:
+        idx = s.index(':')
+        if idx > 15:
+            s = s.split(':', 1)[0]
+        elif os.name == 'nt' or sys.platform.startswith('win'):
+            s = s.replace(':', ',')
+        else:
+            s = s.replace(':', '_')
+
+    for ch in '~#%&*{}\\<>?/`\'"|+;:':
+        if ch in s:
+            s = s.replace(ch, '_')
+
     s = _re.sub(r'\s+', ' ', s).strip(' .')
     if not s:
         s = 'book'
