@@ -112,6 +112,7 @@ import shutil
 import subprocess
 import sys
 import time
+import tempfile
 import zipfile
 from pathlib import Path
 from urllib.parse import unquote
@@ -248,43 +249,31 @@ def check_python_version(*, assume_yes=False):
                 + report_hint()
             )
 
-    # Too new / untested
+    # Too new / untested — warn only (do not abort)
     if sys.version_info[:2] > MAX_TESTED_PYTHON[:2]:
         tested = '.'.join(str(x) for x in MAX_TESTED_PYTHON)
         print(
             f'warning: Python {have} is newer than the highest version this '
             f'script was tested with ({tested}.x).\n'
-            f'  It may still work, but unexpected breakage is possible.',
+            f'  It may still work; continuing. Report issues at:\n'
+            f'    {REPORT_URL}',
             file=sys.stderr,
         )
-        if not ask_continue('Continue with this untested Python version?',
-                            assume_yes=assume_yes):
-            _die(
-                'Aborted. Install a tested Python version or pass --yes.\n'
-                + report_hint()
-            )
 
 
 def check_operating_system(*, assume_yes=False):
+    """Warn on untested OS (macOS, etc.); do not abort — user can still run."""
     import platform
     system = platform.system() or 'Unknown'
     if system in SUPPORTED_OS:
         return system
-    # macOS and others
     print(
-        f'warning: operating system {system!r} is not in the supported set '
+        f'warning: operating system {system!r} is not in the primary set '
         f'{SUPPORTED_OS}.\n'
-        f'  This script is optimized for Linux and Windows. Other systems '
-        f'are untested and may fail (paths, permissions, Calibre, webview).',
+        f'  Linux and Windows are the main targets; {system} is untested '
+        f'and may need extra setup (paths, Calibre, webview). Continuing.',
         file=sys.stderr,
     )
-    if not ask_continue(
-            f'Continue anyway on {system}?',
-            assume_yes=assume_yes):
-        _die(
-            'Aborted. Use Linux or Windows, or pass --yes to override.\n'
-            + report_hint()
-        )
     return system
 
 
@@ -386,6 +375,8 @@ CONFIG = {
     'options_file': '.oreilly_options.json',
     # If True, write options_file after every successful run
     'auto_save_options': False,
+    # After each successful EPUB, also write a PDF via Calibre when available
+    'convert_pdf': False,
 }
 # =============================================================================
 
@@ -407,14 +398,45 @@ RETRYABLE_STATUSES = {403, 429, 500, 502, 503, 504}
 DEFAULT_CONCURRENCY = int(CONFIG.get('concurrency', 8))
 
 # DNS / connection drops are common on Termux and mobile networks.
+# Broad client failures that should be retried (disconnects, truncated
+# bodies, DNS, timeouts). ClientError is the aiohttp base for these.
 _NETWORK_ERRORS = (
-    aiohttp.ClientConnectorError,
-    aiohttp.ClientOSError,
-    aiohttp.ServerTimeoutError,
+    aiohttp.ClientError,          # includes ServerDisconnectedError,
+                                  # ClientPayloadError, ClientConnectorError, …
     asyncio.TimeoutError,
     ConnectionError,
     OSError,
 )
+
+# Shared across concurrent get_with_retry calls within one book download.
+# A dead session must not burn 10 retries × N files against the API.
+_SESSION_GUARD = {
+    'consecutive_403': 0,
+    'limit': 15,
+    'aborted': False,
+    'abort_reason': '',
+}
+
+
+def _reset_session_guard(*, limit=15):
+    _SESSION_GUARD['consecutive_403'] = 0
+    _SESSION_GUARD['limit'] = int(limit)
+    _SESSION_GUARD['aborted'] = False
+    _SESSION_GUARD['abort_reason'] = ''
+
+
+def _jwt_exp_unix(jwt_value):
+    """Return JWT `exp` as unix timestamp, or None if unreadable."""
+    if not jwt_value or jwt_value.count('.') < 2:
+        return None
+    try:
+        payload = jwt_value.split('.')[1]
+        payload += '=' * (-len(payload) % 4)
+        data = json.loads(base64.urlsafe_b64decode(payload))
+        exp = data.get('exp')
+        return int(exp) if exp else None
+    except Exception:
+        return None
 
 _XML_DECL_RE = re.compile(r'^\s*<\?xml[^>]*\?>\s*', re.IGNORECASE)
 
@@ -469,29 +491,56 @@ def _unescape_raw_text_elements(xhtml_bytes):
 
 
 async def get_with_retry(session, url, *, max_attempts=30, base_delay=3.0,
-                          max_delay=60.0, consecutive_403_limit=10):
-    """GET url and return its raw bytes, retrying with exponential backoff
-    on rate-limit/anti-bot/transient server responses and network blips.
+                          max_delay=60.0, consecutive_403_limit=None):
+    """GET url and return its raw bytes, with retries and shared session guard.
 
-    A single flaky or rate-limited request shouldn't take down an entire
-    multi-hundred-file book download - previously any non-2xx response
-    raised straight through asyncio.gather and aborted the whole run,
-    discarding every file that hadn't been written to the zip yet.
-
-    Consecutive 403s abort early so an expired session does not hang for
-    many minutes under max_attempts.
-
-    Empty 200 bodies are treated as transient failures (not success): some
-    edge/CDN glitches return HTTP 200 with zero bytes, and caching that
-    would poison every later re-run until --force.
+    - Retries rate-limit / transient HTTP statuses and any aiohttp.ClientError
+      (including ServerDisconnectedError and ClientPayloadError).
+    - Shared consecutive-403 counter aborts the whole book run once a dead
+      session is clear, instead of each file burning its own retry budget.
+    - Honours Retry-After when present.
+    - Follows redirects only onto allowed_hosts (host allowlist).
+    - Empty 200 bodies are treated as transient failures (not cached).
     """
-    consecutive_403 = 0
+    if consecutive_403_limit is not None:
+        _SESSION_GUARD['limit'] = int(consecutive_403_limit)
+
     for attempt in range(1, max_attempts + 1):
+        if _SESSION_GUARD.get('aborted'):
+            raise RuntimeError(
+                _SESSION_GUARD.get('abort_reason')
+                or 'Session aborted after persistent 403 responses'
+            )
         try:
             _assert_url_allowed(url)
-            async with session.get(url) as r:
-                r.raise_for_status()
-                consecutive_403 = 0
+            # Manual redirect following so each hop is allowlist-checked
+            current = url
+            r = None
+            for _hop in range(8):
+                r = await session.get(current, allow_redirects=False)
+                if r.status not in (301, 302, 303, 307, 308):
+                    break
+                loc = r.headers.get('Location')
+                r.release()
+                if not loc:
+                    raise RuntimeError(f'Redirect without Location from {current}')
+                # Resolve relative redirects
+                current = str(yarl.URL(current).join(yarl.URL(loc)))
+                _assert_url_allowed(current)
+            assert r is not None
+
+            try:
+                if r.status >= 400:
+                    # Build a ClientResponseError-like path
+                    err = aiohttp.ClientResponseError(
+                        r.request_info, r.history,
+                        status=r.status, message=r.reason,
+                        headers=r.headers,
+                    )
+                    # Attach Retry-After for the handler below
+                    err.retry_after = r.headers.get('Retry-After')
+                    raise err
+
                 # Stream with size cap when configured
                 max_bytes = int(CONFIG.get('max_response_bytes') or 0)
                 if max_bytes > 0:
@@ -509,47 +558,64 @@ async def get_with_retry(session, url, *, max_attempts=30, base_delay=3.0,
                     data = b''.join(chunks)
                 else:
                     data = await r.read()
-                if not data:
-                    short = url.split('/files/')[-1] if '/files/' in url else url
-                    if attempt == max_attempts:
-                        raise RuntimeError(
-                            f'Empty 200 body for {short} after {max_attempts} '
-                            f'attempts — not caching.'
-                        )
-                    delay = min(base_delay * (2 ** (attempt - 1)), max_delay) \
-                        + random.uniform(0, 0.5)
-                    print(f'  got empty 200 body fetching {short}, retrying in '
-                          f'{delay:.1f}s (attempt {attempt}/{max_attempts})')
-                    await asyncio.sleep(delay)
-                    continue
-                return data
+            finally:
+                r.release()
+
+            _SESSION_GUARD['consecutive_403'] = 0
+            if not data:
+                short = url.split('/files/')[-1] if '/files/' in url else url
+                if attempt == max_attempts:
+                    raise RuntimeError(
+                        f'Empty 200 body for {short} after {max_attempts} '
+                        f'attempts — not caching.'
+                    )
+                delay = min(base_delay * (2 ** (attempt - 1)), max_delay) \
+                    + random.uniform(0, 0.5)
+                print(f'  got empty 200 body fetching {short}, retrying in '
+                      f'{delay:.1f}s (attempt {attempt}/{max_attempts})')
+                await asyncio.sleep(delay)
+                continue
+            return data
+
         except aiohttp.ClientResponseError as exc:
             if exc.status == 403:
-                consecutive_403 += 1
-                if consecutive_403 >= consecutive_403_limit:
-                    raise RuntimeError(
-                        f'Persistent 403 after {consecutive_403} attempts for '
-                        f'{url}. Session may be expired – re-export cookies, '
-                        f'or wait a minute if this is rate-limiting.'
-                    ) from exc
+                _SESSION_GUARD['consecutive_403'] += 1
+                n403 = _SESSION_GUARD['consecutive_403']
+                limit = _SESSION_GUARD['limit']
+                if n403 >= limit:
+                    reason = (
+                        f'Persistent 403 after {n403} responses across the '
+                        f'session (limit {limit}). Session may be expired — '
+                        f're-export cookies, or wait if this is rate-limiting.'
+                    )
+                    _SESSION_GUARD['aborted'] = True
+                    _SESSION_GUARD['abort_reason'] = reason
+                    raise RuntimeError(reason) from exc
             else:
-                consecutive_403 = 0
+                # Non-403 HTTP errors do not feed the shared counter
+                pass
+
             if exc.status not in RETRYABLE_STATUSES or attempt == max_attempts:
                 raise
-            # Capped, not just exponential: uncapped, attempt 20 alone is
-            # an 18-day sleep and attempt 25 is over a year, so a
-            # persistently failing file (an expired JWT causing every
-            # request to 403, say) would never practically reach
-            # max_attempts - it would just hang that task, and therefore
-            # the whole asyncio.gather, indefinitely instead of failing
-            # within a reasonable time and surfacing the "expired JWT?"
-            # hint below.
-            delay = min(base_delay * (2 ** (attempt - 1)), max_delay) \
-                + random.uniform(0, 0.5)
+
+            # Prefer Retry-After when the server sends it
+            delay = None
+            ra = getattr(exc, 'retry_after', None) or (
+                exc.headers.get('Retry-After') if getattr(exc, 'headers', None) else None
+            )
+            if ra:
+                try:
+                    delay = min(float(ra), max_delay)
+                except (TypeError, ValueError):
+                    delay = None
+            if delay is None:
+                delay = min(base_delay * (2 ** (attempt - 1)), max_delay) \
+                    + random.uniform(0, 0.5)
             short = url.split('/files/')[-1] if '/files/' in url else url
             print(f'  got {exc.status} fetching {short}, retrying in '
                   f'{delay:.1f}s (attempt {attempt}/{max_attempts})')
             await asyncio.sleep(delay)
+
         except _NETWORK_ERRORS as exc:
             if attempt == max_attempts:
                 raise
@@ -559,6 +625,7 @@ async def get_with_retry(session, url, *, max_attempts=30, base_delay=3.0,
                   f'retrying in {delay:.1f}s '
                   f'(attempt {attempt}/{max_attempts})')
             await asyncio.sleep(delay)
+
 
 
 def _container_xml(opf_zip_path='EPUB/content.opf'):
@@ -1724,10 +1791,10 @@ async def run_connectivity_checks(session_headers, *, assume_yes=False):
         if not online:
             print(f'  site: OFFLINE — {site_detail}', file=sys.stderr)
             _die(
-                'error: cannot reach learning.oreilly.com.\\n'
-                '  Check your internet connection, VPN, or firewall.\\n'
-                '  If the site is up in a browser but not here, DNS or TLS\\n'
-                '  interception may be blocking this script.\\n'
+                'error: cannot reach learning.oreilly.com.\n'
+                '  Check your internet connection, VPN, or firewall.\n'
+                '  If the site is up in a browser but not here, DNS or TLS\n'
+                '  interception may be blocking this script.\n'
                 + report_hint()
             )
         print(f'  site: online — {site_detail}')
@@ -1738,17 +1805,17 @@ async def run_connectivity_checks(session_headers, *, assume_yes=False):
             print(f'  api: UNAVAILABLE — {api_detail}', file=sys.stderr)
             print(
                 f'  This script expects API version {api_ver} '
-                f'(/api/v{api_ver}/epubs/...).\\n'
-                f'  O\'Reilly may have changed or removed this API.\\n'
+                f'(/api/v{api_ver}/epubs/...).\n'
+                f'  O\'Reilly may have changed or removed this API.\n'
                 f'  Open an Issue if the site works in a browser but this '
-                f'check keeps failing:\\n'
+                f'check keeps failing:\n'
                 f'    {REPORT_URL}',
                 file=sys.stderr,
             )
             if not ask_continue(
                     'Continue anyway? Downloads will likely fail.',
                     assume_yes=assume_yes):
-                _die('Aborted due to API availability check.\\n' + report_hint())
+                _die('Aborted due to API availability check.\n' + report_hint())
             print('  continuing despite API check failure …')
         else:
             print(f'  api: ok — {api_detail}')
@@ -1845,6 +1912,7 @@ async def fetch_book(book_id, zfh, session, concurrency=DEFAULT_CONCURRENCY,
         are untouched)
     """
     root_path = f'/api/v2/epubs/urn:orm:book:{book_id}/files/'
+    _reset_session_guard(limit=15)
 
     book_info = await fetch_book_info(session, book_id)
     if book_info.get('title'):
@@ -1923,7 +1991,8 @@ async def fetch_book(book_id, zfh, session, concurrency=DEFAULT_CONCURRENCY,
                 await asyncio.sleep(random.uniform(0, 0.2))
                 try:
                     content = await get_with_retry(session, result['url'])
-                except (aiohttp.ClientResponseError, RuntimeError) as exc:
+                except (aiohttp.ClientError, RuntimeError, OSError,
+                        asyncio.TimeoutError) as exc:
                     print(f'FAILED to download {full_path}: {exc}')
                     async with progress_lock:
                         failed.append(full_path)
@@ -2059,13 +2128,17 @@ async def fetch_book(book_id, zfh, session, concurrency=DEFAULT_CONCURRENCY,
 
     if failed:
         print()
-        print(f'WARNING: {len(failed)} of {total} files failed to '
-              f'download and are missing from the epub:')
+        print(f'ERROR: {len(failed)} of {total} files failed to download '
+              f'and are missing from the epub:')
         for full_path in failed:
             print(f'  {full_path}')
-        print('This is usually transient rate-limiting or an expired JWT - '
-              'try running again; cached files will be reused automatically '
+        print('This is usually transient rate-limiting or an expired JWT — '
+              're-run the same command; cached files will be reused '
               '(pass --force to re-download everything).')
+        raise RuntimeError(
+            f'{len(failed)} of {total} files missing — refusing to treat '
+            f'a partial EPUB as success (exit non-zero).'
+        )
     elif cached_hits:
         print(f'reused {cached_hits}/{total} files from cache')
 
@@ -2231,7 +2304,15 @@ def save_cookies(path, records, session):
         same_site = morsel['samesite'] or original.get('sameSite')
         if same_site:
             record['sameSite'] = same_site
-        if 'expirationDate' in original:
+        # Prefer JWT's own exp for orm-jwt so a rotated token is not kept
+        # with a stale expirationDate that causes the next load to drop it.
+        if name == 'orm-jwt':
+            jwt_exp = _jwt_exp_unix(value)
+            if jwt_exp is not None:
+                record['expirationDate'] = jwt_exp
+            elif 'expirationDate' in original:
+                record['expirationDate'] = original['expirationDate']
+        elif 'expirationDate' in original:
             record['expirationDate'] = original['expirationDate']
         if original.get('session'):
             record['session'] = True
@@ -2242,12 +2323,31 @@ def save_cookies(path, records, session):
         # this script itself cares about.
         for key, val in original.items():
             record.setdefault(key, val)
+        # Re-apply JWT exp after setdefault so original cannot override it
+        if name == 'orm-jwt':
+            jwt_exp = _jwt_exp_unix(value)
+            if jwt_exp is not None:
+                record['expirationDate'] = jwt_exp
         merged[name] = record
 
-    with open(path, 'w') as f:
-        json.dump(list(merged.values()), f, indent=2)
-    # Restrict permissions so other users on the machine cannot read tokens
-    _chmod_private(path)
+    # Atomic write: temp file + os.replace so an interrupted save cannot
+    # truncate the only copy of a refresh token.
+    abs_path = os.path.abspath(path)
+    parent = os.path.dirname(abs_path) or '.'
+    fd, tmp = tempfile.mkstemp(prefix='.cookies.', suffix='.tmp', dir=parent)
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as f:
+            json.dump(list(merged.values()), f, indent=2)
+            f.write('\n')
+        _chmod_private(tmp)
+        os.replace(tmp, abs_path)
+        _chmod_private(abs_path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def get_cookies_via_webview(profile_dir, start_url=None, timeout_minutes=10):
@@ -2406,6 +2506,62 @@ def ensure_writable_file_parent(file_path, label):
     """Ensure the parent directory of a file path is writable."""
     parent = os.path.dirname(os.path.abspath(file_path)) or '.'
     return ensure_writable_dir(parent, label)
+
+
+
+def convert_epub_to_pdf(epub_path, *, warn_once_state=None):
+    """Convert EPUB → PDF with Calibre ebook-convert. Keeps the EPUB.
+
+    Best-effort: missing Calibre or conversion failure prints a warning and
+    returns False (does not raise). When running as root, sets
+    QTWEBENGINE_DISABLE_SANDBOX=1 like the old batch_download.sh helper.
+
+    warn_once_state: optional dict used to print the 'ebook-convert missing'
+    note only once per process (key 'warned').
+    """
+    if warn_once_state is None:
+        warn_once_state = {}
+    if not epub_path or not os.path.isfile(epub_path):
+        print(f'  warning: cannot convert to PDF — {epub_path!r} not found')
+        return False
+    ebook_convert = shutil.which('ebook-convert')
+    if not ebook_convert:
+        if not warn_once_state.get('warned'):
+            print('  note: ebook-convert (Calibre) not found — skipping PDF '
+                  f'conversion (install from {CALIBRE_URL})')
+            warn_once_state['warned'] = True
+        return False
+    pdf_path = os.path.splitext(epub_path)[0] + '.pdf'
+    env = os.environ.copy()
+    try:
+        if hasattr(os, 'geteuid') and os.geteuid() == 0:
+            env['QTWEBENGINE_DISABLE_SANDBOX'] = '1'
+    except Exception:
+        pass
+    print(f'  converting to PDF → {pdf_path}')
+    try:
+        proc = subprocess.run(
+            [ebook_convert, epub_path, pdf_path, '--pretty-print'],
+            capture_output=True,
+            text=True,
+            timeout=3600,
+            env=env,
+        )
+    except FileNotFoundError:
+        print('  warning: ebook-convert disappeared from PATH — PDF skipped')
+        return False
+    except subprocess.TimeoutExpired:
+        print('  warning: PDF conversion timed out after 1h — EPUB kept')
+        return False
+    if proc.returncode == 0 and os.path.isfile(pdf_path):
+        print(f'  PDF ok: {pdf_path}')
+        return True
+    err = (proc.stderr or proc.stdout or '').strip().splitlines()
+    tail = '\n    '.join(err[-5:]) if err else '(no output)'
+    print(f'  warning: PDF conversion failed (exit {proc.returncode}) — EPUB kept')
+    if tail:
+        print(f'    {tail}')
+    return False
 
 
 def polish_with_calibre(epub_path, *, required=False):
@@ -2585,10 +2741,11 @@ def _validate_cli_args(args):
     """Reject invalid option values / formats before any network I/O."""
     errors = []
 
-    if args.book_id is not None and not str(args.book_id).isdigit():
-        errors.append(
-            f'book id must be digits only (ISBN-style), got {args.book_id!r}'
-        )
+    for _bid in list(getattr(args, 'book_ids', None) or []):
+        if not str(_bid).isdigit():
+            errors.append(
+                f'book id must be digits only (ISBN-style), got {_bid!r}'
+            )
 
     if args.concurrency is not None:
         if not isinstance(args.concurrency, int) or args.concurrency < 1:
@@ -2841,9 +2998,10 @@ async def amain():
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument('book_id', nargs='?', default=None, help=(
-        "the numeric book id from the book's learning.oreilly.com URL. "
-        "Optional when --books FILE is set (or CONFIG books_file exists)."
+    parser.add_argument('book_ids', nargs='*', default=[], help=(
+        "One or more numeric book ids from learning.oreilly.com URLs. "
+        "Optional when --books FILE is set (or CONFIG books_file exists). "
+        "Example: 9781617295355 9781633437777"
     ))
     parser.add_argument('--jwt', help=(
         "Just the 'orm-jwt' cookie value. A quick one-off shortcut, but it "
@@ -2939,6 +3097,10 @@ async def amain():
         "with --calibre, then convert to AZW3/MOBI in Calibre with "
         "'Ignore margins' enabled."
     ))
+    parser.add_argument('--pdf', action='store_true', help=(
+        "After each successful EPUB, also convert to PDF with Calibre "
+        "ebook-convert (keeps the EPUB). Off by default — pass --pdf to enable."
+    ))
     parser.add_argument('--log', metavar='PATH', default=None, help=(
         "Write a detailed debug log to PATH (created if missing). Useful for "
         "diagnosing auth, path rewriting, and download failures. Console "
@@ -3016,7 +3178,7 @@ async def amain():
         if os.path.isfile(default_cookies):
             args.cookies = default_cookies
             log.info('using CONFIG cookies_path: %s', default_cookies)
-    if args.books is None and not getattr(args, 'book_id', None):
+    if args.books is None and not (getattr(args, 'book_ids', None) or getattr(args, 'book_id', None)):
         # allow bare run with only CONFIG books_file if it exists
         bf = CONFIG.get('books_file')
         if bf and os.path.isfile(bf):
@@ -3128,23 +3290,28 @@ async def amain():
     if args.webview and not records:
         _run_webview_login()
 
-    # ---- build job list (single book_id and/or --books file) ----
+    # ---- build job list (CLI ids and/or --books file) ----
     jobs = []  # list of (book_id, title)
     if args.books:
         if not os.path.isfile(args.books):
             _die(f'error: books file not found: {args.books!r}')
         jobs.extend(list(parse_books_file(args.books)))
         log.info('loaded %d book(s) from %s', len(jobs), args.books)
-    if args.book_id:
-        if not str(args.book_id).isdigit():
+    for bid in list(getattr(args, 'book_ids', None) or []):
+        if not str(bid).isdigit():
             _die(
-                f'error: book id must be digits only, got {args.book_id!r}\n'
+                f'error: book id must be digits only, got {bid!r}\n'
                 f'  Example: 9781617295355\n'
                 + report_hint()
             )
-        # Avoid duplicating if the same id is also in the books file
-        if not any(j[0] == args.book_id for j in jobs):
-            jobs.insert(0, (args.book_id, ''))
+        if not any(j[0] == bid for j in jobs):
+            jobs.append((bid, ''))
+    # Legacy: some internal paths may still set book_id
+    if getattr(args, 'book_id', None):
+        bid = args.book_id
+        if str(bid).isdigit() and not any(j[0] == bid for j in jobs):
+            jobs.insert(0, (bid, ''))
+
     if not jobs and getattr(args, 'save_options', False):
         # Allow saving defaults without downloading
         save_options(args)
@@ -3193,6 +3360,7 @@ async def amain():
     await run_connectivity_checks(session_headers, assume_yes=args.yes)
 
     any_failed = False
+    pdf_warn_state = {}  # print "ebook-convert missing" only once
     for job_index, (book_id, book_title) in enumerate(jobs, 1):
         args.book_id = book_id
         print(f'\n======== [{job_index}/{len(jobs)}] {book_id}'
@@ -3249,6 +3417,14 @@ async def amain():
             except Exception as exc:  # noqa: BLE001
                 any_failed = True
                 write_error_log(exc, context=f'calibre book_id={book_id}')
+
+        # Optional PDF — off unless --pdf or CONFIG convert_pdf=True
+        do_pdf = bool(getattr(args, 'pdf', False) or CONFIG.get('convert_pdf', False))
+        if do_pdf and os.path.isfile(filename):
+            try:
+                convert_epub_to_pdf(filename, warn_once_state=pdf_warn_state)
+            except Exception as exc:  # noqa: BLE001
+                print(f'  warning: PDF conversion error: {exc} — EPUB kept')
 
     if any_failed:
         sys.exit(1)
