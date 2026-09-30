@@ -1,0 +1,7 @@
+# books.txt — one book per line
+# Format:  BOOK_ID
+#      or: BOOK_ID # "Title for the output filename"
+# BOOK_ID must be digits only. Only one # separator is allowed.
+
+9780000000001 # "Example Book Title"
+9780000000002 # "Sample Training Guide"

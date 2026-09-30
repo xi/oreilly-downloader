@@ -16,11 +16,11 @@ QUICK START
        site" to cookies.json. You do not need to hand-pick which cookies;
        anything not scoped to oreilly.com is ignored automatically.
     3. Find the book's ID: it's the digits in the book's learning.oreilly.com
-       URL, e.g. for https://learning.oreilly.com/library/view/some-book/9781633437777/
-       the id is 9781633437777.
+       URL, e.g. for https://learning.oreilly.com/library/view/some-book/9780000000002/
+       the id is 9780000000002.
     4. Run:
-           python3 oreilly_downloader.py 9781633437777 --cookies cookies.json
-       This writes 9781633437777.epub in the current directory.
+           python3 oreilly_downloader.py 9780000000002 --cookies cookies.json
+       This writes 9780000000002.epub in the current directory.
 
     Re-run the exact same command whenever you need another book (with a
     different id) - --cookies keeps itself up to date (see below), so you
@@ -77,7 +77,7 @@ IF AUTHENTICATION FAILS
     display (X11/Wayland/macOS/Windows desktop); it will not work over a
     plain SSH terminal or inside a headless container. Combine with
     --cookies so the result is saved for next time rather than used once:
-        python3 oreilly_downloader.py 9781633437777 --cookies cookies.json --webview
+        python3 oreilly_downloader.py 9780000000002 --cookies cookies.json --webview
     --webview-profile controls where pywebview keeps its own persistent
     browser profile between runs (default: a folder next to --cookies), so
     in practice logging in is a one-time thing, not a per-run one.
@@ -2022,7 +2022,7 @@ async def fetch_book(book_id, zfh, session, concurrency=DEFAULT_CONCURRENCY,
                 elif full_path.endswith('.opf'):
                     content = rewrite_opf(content, root_path, full_path)
                     # The API doesn't always name the package document
-                    # "content.opf" (e.g. it may be "9780138308667.opf") but
+                    # "content.opf" (e.g. it may be "9780000000099.opf") but
                     # container.xml always points at "EPUB/content.opf".
                     out_path = 'content.opf'
                 elif full_path.endswith('.ncx'):
@@ -2872,14 +2872,14 @@ def print_quick_reference():
         f"       python3 {prog} BOOK_ID --cookies cookies.json",
         "",
         "Examples",
-        f"  python3 {prog} 9781617295355 --cookies cookies.json",
-        f"  python3 {prog} 9781617295355 --cookies cookies.json --calibre",
+        f"  python3 {prog} 9780000000001 --cookies cookies.json",
+        f"  python3 {prog} 9780000000001 --cookies cookies.json --calibre",
         f"  python3 {prog} --books books.txt --cookies cookies.json",
-        f"  python3 {prog} 9781617295355 --cookies cookies.json --raw --calibre",
+        f"  python3 {prog} 9780000000001 --cookies cookies.json --raw --calibre",
         f"  python3 {prog} --cookies cookies.json --webview",
         "",
         "Common options",
-        "  BOOK_ID              Digits from the book URL (.../9781617295355/)",
+        "  BOOK_ID              Digits from the book URL (.../9780000000001/)",
         "  --cookies PATH       Browser cookie export (recommended)",
         "  --books FILE         List of ids:  978... # \"Title\"",
         "  --calibre            Polish EPUB with Calibre ebook-convert",
@@ -2895,8 +2895,8 @@ def print_quick_reference():
         "  -h, --help           Full detailed help",
         "",
         "books.txt format",
-        '  9781617295355 # "Math for Programmers"',
-        "  9781633437777",
+        '  9780000000001 # "Example Book Title"',
+        "  9780000000002",
         "",
         f"Need more detail?  Run:  python3 {prog} --help",
         f"Report bugs:  {REPORT_URL}",
@@ -2932,8 +2932,8 @@ async def amain():
             "\n"
             "BOOK ID\n"
             "  From the book URL on learning.oreilly.com, e.g.\n"
-            "    https://learning.oreilly.com/library/view/some-book/9781633437777/\n"
-            "  -> book_id is 9781633437777 (digits only).\n"
+            "    https://learning.oreilly.com/library/view/some-book/9780000000002/\n"
+            "  -> book_id is 9780000000002 (digits only).\n"
             "\n"
             "AUTHENTICATION\n"
             "  --cookies PATH   Preferred. Export all cookies for\n"
@@ -2955,8 +2955,8 @@ async def amain():
             "\n"
             "BATCH / LISTS\n"
             "  --books FILE     One book per line:\n"
-            '                     9781617295355 # "Title Here"\n'
-            "                     9781633437777\n"
+            '                     9780000000001 # "Example Title"\n'
+            "                     9780000000002\n"
             "                   book_id must be digits; only one # separator.\n"
             "  --output-dir DIR Write EPUBs into DIR.\n"
             "\n"
@@ -2988,8 +2988,8 @@ async def amain():
             "  CLI flags always override CONFIG.\n"
             "\n"
             "EXAMPLES\n"
-            "  python3 oreilly_downloader.py 9781633437777 --cookies cookies.json\n"
-            "  python3 oreilly_downloader.py 9781633437777 --cookies cookies.json --calibre\n"
+            "  python3 oreilly_downloader.py 9780000000002 --cookies cookies.json\n"
+            "  python3 oreilly_downloader.py 9780000000002 --cookies cookies.json --calibre\n"
             "  python3 oreilly_downloader.py --books books.txt --cookies cookies.json\n"
             "  python3 oreilly_downloader.py --cookies cookies.json --webview\n"
             "\n"
@@ -3001,7 +3001,7 @@ async def amain():
     parser.add_argument('book_ids', nargs='*', default=[], help=(
         "One or more numeric book ids from learning.oreilly.com URLs. "
         "Optional when --books FILE is set (or CONFIG books_file exists). "
-        "Example: 9781617295355 9781633437777"
+        "Example: 9780000000001 9780000000002"
     ))
     parser.add_argument('--jwt', help=(
         "Just the 'orm-jwt' cookie value. A quick one-off shortcut, but it "
@@ -3301,7 +3301,7 @@ async def amain():
         if not str(bid).isdigit():
             _die(
                 f'error: book id must be digits only, got {bid!r}\n'
-                f'  Example: 9781617295355\n'
+                f'  Example: 9780000000001\n'
                 + report_hint()
             )
         if not any(j[0] == bid for j in jobs):
@@ -3321,13 +3321,13 @@ async def amain():
     if not jobs:
         _die(
             'error: no books to download.\n'
-            '  Pass a book id:  python3 oreilly_downloader.py 9781617295355 '
+            '  Pass a book id:  python3 oreilly_downloader.py 9780000000001 '
             '--cookies cookies.json\n'
             '  Or a list file:  python3 oreilly_downloader.py --books books.txt '
             '--cookies cookies.json\n'
             f'  Or create {CONFIG.get("books_file", "books.txt")!r} '
             f'(CONFIG books_file) with lines like:\n'
-            '    9781617295355 # "Math for Programmers"'
+            '    9780000000001 # "Example Book Title"'
         )
 
     out_dir = args.output_dir or '.'

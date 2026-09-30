@@ -1,0 +1,8 @@
+# O'Reilly book list — one per line:
+#   BOOK_ID # "Title for the .epub filename"
+# BOOK_ID must be digits only. Only one # separator is allowed.
+# Invalid lines are skipped with an error message.
+
+9780000000001 # "Example Book Title"
+9780000000002 # "Sample Training Guide"
+# 9780000000003 # "skipped example"

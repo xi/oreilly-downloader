@@ -124,7 +124,7 @@ python3 oreilly_downloader.py --version
 The script carries inline dependency metadata. `uv run` installs what it needs on first use:
 
 ```bash
-uv run oreilly_downloader.py 9781098148706 --cookies cookies.json
+uv run oreilly_downloader.py 9780000000003 --cookies cookies.json
 ```
 
 ### With pip + python3
@@ -134,7 +134,7 @@ pip install aiohttp lxml yarl
 # if your environment blocks system installs:
 # pip install aiohttp lxml yarl --break-system-packages
 
-python3 oreilly_downloader.py 9781098148706 --cookies cookies.json
+python3 oreilly_downloader.py 9780000000003 --cookies cookies.json
 ```
 
 ### Optional tools
@@ -159,13 +159,13 @@ pip install pywebview
    (extensions such as [Cookie-Editor](https://cookie-editor.com/) or EditThisCookie work). Export **all** cookies for the site, not only `orm-jwt`.
 3. **Find the book id** — the digit string in the book URL:
 
-   `https://learning.oreilly.com/library/view/some-book/9781098148706/`  
-   → id is `9781098148706`.
+   `https://learning.oreilly.com/library/view/example-book/9780000000003/`  
+   → id is `9780000000003`.
 
 4. **Download:**
 
 ```bash
-python3 oreilly_downloader.py 9781098148706 --cookies cookies.json
+python3 oreilly_downloader.py 9780000000003 --cookies cookies.json
 ```
 
 You should see authentication status, a file listing, download progress, and finally a created `.epub` in the current directory (or `--output-dir`).
@@ -173,13 +173,13 @@ You should see authentication status, a file listing, download progress, and fin
 5. **Optional — remember flags and polish with Calibre:**
 
 ```bash
-python3 oreilly_downloader.py 9781098148706 --cookies cookies.json --calibre --save-options
+python3 oreilly_downloader.py 9780000000003 --cookies cookies.json --calibre --save-options
 ```
 
 Later:
 
 ```bash
-python3 oreilly_downloader.py 9781098148706
+python3 oreilly_downloader.py 9780000000003
 # picks up saved --cookies and --calibre from .oreilly_options.json
 ```
 
@@ -212,7 +212,7 @@ The file written back is the full list shape (extension-friendly), mode `0600` o
 Use when exports keep failing or Akamai blocks scripted requests:
 
 ```bash
-python3 oreilly_downloader.py 9781098148706 --cookies cookies.json --webview
+python3 oreilly_downloader.py 9780000000003 --cookies cookies.json --webview
 ```
 
 Opens a native browser window, lets you log in normally, then captures cookies (including sensor cookies) and saves them to `--cookies` when provided. Requires a graphical session (not plain SSH without display forwarding). Install with `pip install pywebview`; on Linux you may need WebKitGTK (see [pywebview installation notes](https://pywebview.flowrl.com/)). Profile data is stored under `--webview-profile` or a default folder next to your cookies file.
@@ -239,7 +239,7 @@ python3 oreilly_downloader.py --books FILE [options]
 
 | Argument | Description |
 | --- | --- |
-| `BOOK_ID …` | Zero or more numeric ids from the Learning URL (digits only). Example: `9781617295355 9781633437777`. Optional when `--books` is set or a `CONFIG` books file exists. |
+| `BOOK_ID …` | Zero or more numeric ids from the Learning URL (digits only). Example: `9780000000001 9780000000002`. Optional when `--books` is set or a `CONFIG` books file exists. |
 | `--cookies PATH` | Path to cookie JSON. Preferred auth method. |
 | `--jwt VALUE` | `orm-jwt` string only; short-lived. **Never** written to the saved-options file. |
 | `--books FILE` | Download every valid line in FILE (see [Batch download](#batch-download)). |
@@ -303,7 +303,7 @@ Injects `Styles/kindle-fix.css` and links it from every chapter so wide **tables
 ### `--pdf` (opt-in)
 
 ```bash
-python3 oreilly_downloader.py 9781098148706 --cookies cookies.json --pdf
+python3 oreilly_downloader.py 9780000000003 --cookies cookies.json --pdf
 ```
 
 After a successful EPUB (and optional title rename / `--calibre`), runs `ebook-convert` to `<same-stem>.pdf` with `--pretty-print`. The EPUB is **not** deleted. Default is **off**; enable with `--pdf` or `CONFIG['convert_pdf'] = True`.
@@ -320,9 +320,9 @@ Batch mode is **built into** `oreilly_downloader.py`. You do not need the shell 
 
 ```text
 # comments and blank lines ignored
-9781617295355 # "Math for Programmers"
-9781633437777 # 'Grokking Deep Learning'
-9781098104030
+9780000000001 # "Example Book Title"
+9780000000002 # 'Sample Training Guide'
+9780000000004
 ```
 
 Rules:
@@ -337,7 +337,7 @@ Rules:
 
 ```bash
 python3 oreilly_downloader.py --books books.txt --cookies cookies.json
-python3 oreilly_downloader.py 9781617295355 9781633437777 --cookies cookies.json
+python3 oreilly_downloader.py 9780000000001 9780000000002 --cookies cookies.json
 python3 oreilly_downloader.py --books books.txt --cookies cookies.json --calibre --pdf
 ```
 
@@ -389,7 +389,7 @@ Creates or updates `.oreilly_options.json` (path overridable via `CONFIG['option
 
 ```bash
 python3 oreilly_downloader.py --print-options
-python3 oreilly_downloader.py 9781098148706   # uses saved defaults
+python3 oreilly_downloader.py 9780000000003   # uses saved defaults
 ```
 
 - **CLI always wins** over the file.
@@ -596,7 +596,7 @@ Use `-y` / `--yes` to auto-accept interactive confirms in CI or wrappers (use ca
 ## Logging and error reports
 
 ```bash
-python3 oreilly_downloader.py 978… --cookies cookies.json --log debug.log --verbose
+python3 oreilly_downloader.py 9780000000003 --cookies cookies.json --log debug.log --verbose
 ```
 
 - `--log` — DEBUG detail to a file (redacted).  
@@ -621,7 +621,7 @@ Contents include timestamp, Python version, script version, redacted argv, and t
 ### Built-in `--calibre`
 
 ```bash
-python3 oreilly_downloader.py 9781491958698 --cookies cookies.json --calibre
+python3 oreilly_downloader.py 9780000000005 --cookies cookies.json --calibre
 ```
 
 If `ebook-convert` is missing, the script exits **before** downloading and points you to the official installer.
@@ -629,16 +629,16 @@ If `ebook-convert` is missing, the script exits **before** downloading and point
 ### Built-in `--pdf` (opt-in)
 
 ```bash
-python3 oreilly_downloader.py 9781491958698 --cookies cookies.json --pdf
+python3 oreilly_downloader.py 9780000000005 --cookies cookies.json --pdf
 ```
 
-Creates `9781491958698.pdf` beside the EPUB. Does not delete the EPUB. Off unless you pass `--pdf` or set `CONFIG['convert_pdf'] = True`.
+Creates `9780000000005.pdf` beside the EPUB. Does not delete the EPUB. Off unless you pass `--pdf` or set `CONFIG['convert_pdf'] = True`.
 
 ### Manual conversion
 
 ```bash
-ebook-convert "9781491958698.epub" "9781491958698_CLEAR.epub"
-ebook-convert "9781491958698.epub" "9781491958698.pdf" --pretty-print
+ebook-convert "9780000000005.epub" "example_CLEAR.epub"
+ebook-convert "9780000000005.epub" "9780000000005.pdf" --pretty-print
 ```
 
 ### `--kindle` (table / pre overflow)
@@ -650,8 +650,8 @@ For Amazon Kindle and other narrow E-Ink screens, wide tables and preformatted c
 - Caps `img` / `svg` to `max-width: 100%`
 
 ```bash
-python3 oreilly_downloader.py 9781491958698 --cookies cookies.json --kindle
-python3 oreilly_downloader.py 9781491958698 --cookies cookies.json --kindle --calibre
+python3 oreilly_downloader.py 9780000000005 --cookies cookies.json --kindle
+python3 oreilly_downloader.py 9780000000005 --cookies cookies.json --kindle --calibre
 ```
 
 Ignored with `--raw`. You can also set `CONFIG['kindle_fix'] = True`.
