@@ -2,7 +2,7 @@
 # Thin wrapper — batch download is built into oreilly_downloader.py.
 # Prefer:
 #   python3 oreilly_downloader.py --books books.txt --cookies cookies.json
-#   python3 oreilly_downloader.py 978… 978… --cookies cookies.json --no-pdf
+#   python3 oreilly_downloader.py 978… 978… --cookies cookies.json --pdf
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DOWNLOADER="${SCRIPT_DIR}/oreilly_downloader.py"
