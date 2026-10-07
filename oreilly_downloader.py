@@ -24,7 +24,7 @@ CONTAINER = b"""<?xml version="1.0"?>
 """  # noqa
 
 
-def to_xhtml(s, root_path):
+def to_xhtml(s, root_path, stylesheets):
     tree = lhtml.fromstring(s, parser=lhtml.HTMLParser(encoding='utf-8'))
 
     for el in list(tree.iter()):
@@ -38,9 +38,11 @@ def to_xhtml(s, root_path):
             'epub': 'http://www.idpf.org/2007/ops',
         })
 
+        head = etree.SubElement(wrapper, 'head')
+        for href in stylesheets:
+            etree.SubElement(head, 'link', rel='stylesheet', href=href)
         h1 = tree.find('.//h1')
         if h1 is not None:
-            head = etree.SubElement(wrapper, 'head')
             title = etree.SubElement(head, 'title')
             title.text = ''.join(h1.itertext()).strip()
 
@@ -65,13 +67,15 @@ async def check_auth(session):
 
 async def fetch_book(book_id, zfh, session, *, delay=0):
     root_path = f'/api/v2/epubs/urn:orm:book:{book_id}/files/'
+    html = {}
 
     async def download(url, path):
         async with session.get(url) as r:
             content = await r.read()
             if path.endswith(('.html', '.xhtml')):
-                content = to_xhtml(content, root_path)
-            zfh.writestr(path, content)
+                html[path] = content
+            else:
+                zfh.writestr(path, content)
 
     zfh.writestr('mimetype', b'application/epub+zip', compress_type=zipfile.ZIP_STORED)
     zfh.writestr('META-INF/container.xml', CONTAINER)
@@ -90,6 +94,10 @@ async def fetch_book(book_id, zfh, session, *, delay=0):
         url = data.get('next')
         if url:
             await asyncio.sleep(delay)
+
+    css = [p.removeprefix('EPUB/') for p in zfh.namelist() if p.endswith('.css')]
+    for path, content in html.items():
+        zfh.writestr(path, to_xhtml(content, root_path, css))
 
 
 async def amain():
