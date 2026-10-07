@@ -7,6 +7,7 @@
 
 import argparse
 import asyncio
+import posixpath
 import zipfile
 
 import aiohttp
@@ -24,13 +25,14 @@ CONTAINER = b"""<?xml version="1.0"?>
 """  # noqa
 
 
-def to_xhtml(s, root_path, stylesheets):
+def to_xhtml(s, root_path, path, stylesheets):
     tree = lhtml.fromstring(s, parser=lhtml.HTMLParser(encoding='utf-8'))
+    base = posixpath.dirname(root_path + path)
 
     for el in list(tree.iter()):
         for attr in ['href', 'src']:
             if (el.get(attr) or '').startswith(root_path):
-                el.set(attr, el.get(attr).removeprefix(root_path))
+                el.set(attr, posixpath.relpath(el.get(attr), base))
 
     if tree.tag != 'html':
         wrapper = etree.Element('html', nsmap={
@@ -40,7 +42,7 @@ def to_xhtml(s, root_path, stylesheets):
 
         head = etree.SubElement(wrapper, 'head')
         for href in stylesheets:
-            etree.SubElement(head, 'link', rel='stylesheet', href=href)
+            etree.SubElement(head, 'link', rel='stylesheet', href=posixpath.relpath(root_path + href, base))
         h1 = tree.find('.//h1')
         if h1 is not None:
             title = etree.SubElement(head, 'title')
@@ -97,7 +99,7 @@ async def fetch_book(book_id, zfh, session, *, delay=0):
 
     css = [p.removeprefix('EPUB/') for p in zfh.namelist() if p.endswith('.css')]
     for path, content in html.items():
-        zfh.writestr(path, to_xhtml(content, root_path, css))
+        zfh.writestr(path, to_xhtml(content, root_path, path.removeprefix('EPUB/'), css))
 
 
 async def amain():
